@@ -8,7 +8,7 @@ enum PurchaseBrowser: String, Codable, CaseIterable {
     var title: String { self == .safari ? "Safari" : "Chrome" }
     static func defaultBrowser(for url: String) -> PurchaseBrowser {
         guard let parsed = URL(string: url), parsed.scheme?.lowercased() == "https", let host = parsed.host?.lowercased() else { return .chrome }
-        return ["apple.com", "apple.com.cn"].contains { host == $0 || host.hasSuffix("." + $0) } ? .safari : .chrome
+        return ["apple.com", "apple.com.cn", "jd.com"].contains { host == $0 || host.hasSuffix("." + $0) } ? .safari : .chrome
     }
 }
 
@@ -22,6 +22,8 @@ struct PurchaseTask: Identifiable, Codable {
     var douyinHandoff: Bool?
     var tmall: Bool?
     var tmallFlow: Bool?
+    var jd: Bool?
+    var jdFlow: Bool?
     var submitOrder: Bool?
     var browser: PurchaseBrowser?
     var selectedBrowser: PurchaseBrowser { browser ?? (demo ? .chrome : PurchaseBrowser.defaultBrowser(for: url)) }
@@ -34,6 +36,23 @@ struct LogEntry: Identifiable {
     let id = UUID()
     let time = Date()
     let message: String
+}
+
+enum PurchaseTaskStore {
+    static func load(preferences: UserDefaults, defaultsURL: URL?) -> [PurchaseTask] {
+        let data: Data?
+        if preferences.object(forKey: "tasks") != nil {
+            data = preferences.data(forKey: "tasks")
+        } else {
+            data = defaultsURL.flatMap { try? Data(contentsOf: $0) }
+        }
+        guard let data, let saved = try? JSONDecoder().decode([PurchaseTask].self, from: data) else { return [] }
+        return saved.map { task in
+            var copy = task
+            copy.state = "idle"; copy.message = "请重新打开并绑定按钮"; copy.delayMs = nil
+            return copy
+        }
+    }
 }
 
 @MainActor
@@ -57,13 +76,8 @@ final class RadarModel: ObservableObject {
     private let preferences = UserDefaults.standard
 
     init() {
-        if let data = preferences.data(forKey: "tasks"), let saved = try? JSONDecoder().decode([PurchaseTask].self, from: data) {
-            tasks = saved.map { task in
-                var copy = task
-                copy.state = "idle"; copy.message = "请重新打开并绑定按钮"; copy.delayMs = nil
-                return copy
-            }
-        }
+        tasks = PurchaseTaskStore.load(preferences: preferences, defaultsURL: Bundle.main.url(forResource: "default-tasks", withExtension: "json"))
+        persist()
         startWorker()
     }
 
@@ -145,6 +159,7 @@ final class RadarModel: ObservableObject {
         let message = event["message"] as? String ?? ""
         switch type {
         case "started": connected = true; appendLog("本地执行服务已连接")
+        case "diagnostic": appendLog(message)
         case "status":
             guard let id = event["id"] as? String, let index = tasks.firstIndex(where: { $0.id == id }) else { return }
             tasks[index].state = event["state"] as? String ?? "idle"
@@ -154,7 +169,7 @@ final class RadarModel: ObservableObject {
                 NSSound.beep()
                 mobileReminder = message
             }
-            if tasks[index].state == "paymentReady" {
+            if tasks[index].state == "paymentReady" || (tasks[index].jd == true && tasks[index].state == "reviewOrder") {
                 NSSound.beep()
                 paymentReminder = "\(tasks[index].name)：\(message)"
             }
@@ -190,11 +205,12 @@ final class RadarModel: ObservableObject {
         } catch { self.error = "发送操作失败：\(error.localizedDescription)" }
     }
 
-    func add(name: String, url: String, demo: Bool = false, browser: PurchaseBrowser? = nil, douyinHandoff: Bool = false, tmall: Bool = false) {
+    func add(name: String, url: String, demo: Bool = false, browser: PurchaseBrowser? = nil, douyinHandoff: Bool = false, tmall: Bool = false, jd: Bool = false) {
         let host = URL(string: url)?.host?.lowercased() ?? ""
         let apple = ["apple.com", "apple.com.cn"].contains { host == $0 || host.hasSuffix("." + $0) }
-        tasks.append(PurchaseTask(name: name, url: url, demo: demo, appleFlow: apple && !douyinHandoff && !tmall, douyinHandoff: douyinHandoff, tmall: tmall, tmallFlow: tmall, browser: douyinHandoff || tmall ? .chrome : browser))
+        tasks.append(PurchaseTask(name: name, url: url, demo: demo, appleFlow: apple && !douyinHandoff && !tmall && !jd, douyinHandoff: douyinHandoff, tmall: tmall, tmallFlow: tmall, jd: jd, jdFlow: jd, browser: douyinHandoff || tmall ? .chrome : browser ?? (jd ? .safari : nil)))
         if douyinHandoff { tasks[tasks.count - 1].message = "在手机抖音中准备商品、规格和地址；电脑到点提醒" }
+        if jd { tasks[tasks.count - 1].message = "打开京东购物车，登录、整理本次要购买的商品并核对规格，再绑定全选" }
         if tmall { tasks[tasks.count - 1].message = "打开商品并核对旗舰店，登录、选好规格，再绑定购买按钮" }
         persist()
     }
@@ -213,7 +229,7 @@ final class RadarModel: ObservableObject {
         if let index = tasks.firstIndex(where: { $0.id == task.id }) {
             tasks[index].state = "opening"; tasks[index].message = "正在打开浏览器…"; tasks[index].delayMs = nil
         }
-        send(["type": "open", "id": task.id, "url": task.url, "name": task.name, "demo": task.demo, "appleFlow": task.appleFlow ?? false, "tmallFlow": task.tmallFlow ?? false, "douyinHandoff": task.douyinHandoff ?? false, "submitOrder": task.submitOrder ?? false, "browser": task.selectedBrowser.rawValue])
+        send(["type": "open", "id": task.id, "url": task.url, "name": task.name, "demo": task.demo, "appleFlow": task.appleFlow ?? false, "tmallFlow": task.tmallFlow ?? false, "jdFlow": task.jdFlow ?? false, "douyinHandoff": task.douyinHandoff ?? false, "submitOrder": task.submitOrder ?? false, "browser": task.selectedBrowser.rawValue])
     }
 
     func changeBrowser(_ id: String, to browser: PurchaseBrowser) {
@@ -267,11 +283,11 @@ final class RadarModel: ObservableObject {
         phase = "正在检查各页面…"
         preventSleep()
         let selected = tasks.filter(\.enabled)
-        send(["type": type, "ids": selected.map(\.id), "douyinReminders": selected.filter { $0.douyinHandoff == true }.map { ["id": $0.id, "url": $0.url] }, "appleFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.appleFlow ?? false) }), "tmallFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.tmallFlow ?? false) }), "submitOrders": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.submitOrder ?? false) }), "target": target.timeIntervalSince1970 * 1000])
+        send(["type": type, "ids": selected.map(\.id), "douyinReminders": selected.filter { $0.douyinHandoff == true }.map { ["id": $0.id, "url": $0.url] }, "appleFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.appleFlow ?? false) }), "tmallFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.tmallFlow ?? false) }), "jdFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.jdFlow ?? false) }), "submitOrders": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.submitOrder ?? false) }), "target": target.timeIntervalSince1970 * 1000])
     }
 
     func resume(_ task: PurchaseTask) {
-        guard connected, !running, (task.appleFlow == true || task.tmallFlow == true), ["handoff", "uncertain"].contains(task.state) else { return }
+        guard connected, !running, (task.appleFlow == true || task.tmallFlow == true || task.jdFlow == true), ["handoff", "uncertain"].contains(task.state) else { return }
         running = true
         phase = "正在核查页面并继续结账"
         preventSleep()
@@ -321,6 +337,10 @@ enum PurchaseLink {
         guard let parsed = URL(string: text), parsed.scheme?.lowercased() == "https", let host = parsed.host?.lowercased() else { return false }
         return ["douyin.com", "jinritemai.com"].contains { host == $0 || host.hasSuffix("." + $0) }
     }
+    static func isJDShare(_ text: String) -> Bool {
+        guard let parsed = URL(string: text), parsed.scheme?.lowercased() == "https", let host = parsed.host?.lowercased() else { return false }
+        return ["jd.com", "3.cn"].contains { host == $0 || host.hasSuffix("." + $0) }
+    }
     static func isTmallShare(_ text: String) -> Bool {
         guard let parsed = URL(string: text), parsed.scheme?.lowercased() == "https", let host = parsed.host?.lowercased() else { return false }
         return ["tmall.com", "taobao.com", "tb.cn", "taobao.cn"].contains { host == $0 || host.hasSuffix("." + $0) }
@@ -328,12 +348,13 @@ enum PurchaseLink {
 }
 
 enum PurchaseEntry: String, CaseIterable, Identifiable {
-    case browser, tmall, douyin
+    case browser, tmall, jd, douyin
     var id: String { rawValue }
     var title: String {
         switch self {
         case .browser: return "浏览器购买"
         case .tmall: return "天猫苹果旗舰店"
+        case .jd: return "京东购物车"
         case .douyin: return "抖音苹果旗舰店 · 手机接力"
         }
     }

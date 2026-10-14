@@ -1,5 +1,6 @@
 import { setTimeout as wait } from 'node:timers/promises';
-import { inspectNotice, recoverNotice } from './checkout-recovery.mjs';
+import { selectAllCartItems, resolveSelectAllButton, isSelectAllButton } from './cart-selection.mjs';
+import { inspectNotice, recoverNotice, recoverSubmissionDialog } from './checkout-recovery.mjs';
 
 export function isTmallURL(value) {
   try {
@@ -25,7 +26,7 @@ const tmallSubmitControl = '#submitOrder .trade-buy-btn-submit [class*="btn--"]'
 
 export async function resolveTmallButton(button) {
   const handle = await button.evaluateHandle((element, selector) => element.closest(selector) || element, tmallSubmitControl);
-  return handle.asElement();
+  return resolveSelectAllButton(handle.asElement());
 }
 
 function isOrderCreation(kind, name, info) {
@@ -53,17 +54,45 @@ async function inspectDocument(page) {
   });
 }
 
-export async function checkTmallAction(page, button, { submitOrder = false } = {}) {
+export async function prepareTmallAction(page, button, options = {}, run = { cancelled: false }) {
+  const cart = pageKind(page.url()) === 'cart';
+  if (cart) {
+    await checkTmallAction(page, button, { ...options, binding: true });
+    const selectAll = await isSelectAllButton(button);
+    await selectAllCartItems(page, run, selectAll ? button : undefined);
+  }
+  const deadline = Date.now() + 1500;
+  while (true) {
+    if (run.cancelled) throw new Error('已停止结算');
+    if (cart) {
+      const buttons = await visibleActions(page, checkoutNames);
+      if (buttons.length > 1) throw new Error('全选后结算按钮不明确，请重新绑定');
+      button = buttons[0];
+    }
+    if (button) {
+      try {
+        await checkTmallAction(page, button, options);
+        if (await button.isEnabled()) return button;
+      } catch (error) {
+        if (!/大于 0/.test(error.message) || Date.now() >= deadline) throw error;
+      }
+    }
+    if (Date.now() >= deadline) throw new Error('全选后结算按钮仍不可用，请核查商品是否可购买');
+    await wait(30);
+  }
+}
+
+export async function checkTmallAction(page, button, { submitOrder = false, binding = false } = {}) {
   const kind = pageKind(page.url());
   const name = await label(button);
   const info = await inspectDocument(page);
   if (info.loading) throw new Error('订单页面正在加载，请等待页面显示完整后再运行');
   const createsOrder = isOrderCreation(kind, name, info);
   if (!createsOrder && /支付|付款/.test(name)) throw new Error('付款需要你本人操作，请绑定结算或提交订单按钮');
-  if (!createsOrder && !(kind === 'cart' && checkoutNames.test(name))) throw new Error('天猫自动流程只支持淘宝购物车的结算或确认订单页的提交订单，请重新绑定');
+  if (!createsOrder && !(kind === 'cart' && (checkoutNames.test(name) || binding && name === '全选'))) throw new Error('天猫自动流程只支持淘宝购物车的全选、结算或确认订单页的提交订单，请重新绑定');
   if (kind === 'confirm' && !submitOrder) throw new Error('请开启自动提交订单，或在浏览器中手动提交');
   if (info.blocked) throw new Error(info.blocked);
-  if (!(info.total > 0)) throw new Error('未能确认大于 0 的订单金额；请选中有货商品并核对合计金额');
+  if (!(binding && kind === 'cart') && !(info.total > 0)) throw new Error('未能确认大于 0 的订单金额；请选中有货商品并核对合计金额');
   return kind;
 }
 
@@ -85,7 +114,7 @@ async function visibleActions(page, names) {
 // The bound cart click is issued by the worker. This follows only the known
 // confirmation page, preserving defaults. Its amount-labelled “立即支付”
 // creates the order; controls on the cashier/payment page remain manual.
-export async function continueTmallCheckout(page, run, report, { submitOrder = false, submitted = false, timeoutMs = 45000, pollMs = 200, getPage = () => page, progress = {}, retryDelays, queueTimeoutMs } = {}) {
+export async function continueTmallCheckout(page, run, report, { submitOrder = false, submitted = false, timeoutMs = 45000, pollMs = 200, getPage = () => page, progress = {}, retryDelays = Array(50).fill(0), queueTimeoutMs, submissionRetryDelayMs } = {}) {
   submitted = progress.submitted ||= submitted;
   let deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
@@ -101,7 +130,19 @@ export async function continueTmallCheckout(page, run, report, { submitOrder = f
         if (url.href === 'about:blank') { await wait(pollMs); continue; }
         return { state: 'handoff', message: '页面已离开淘宝/天猫，自动操作已停止，请手动核查' };
       }
-      const notice = await inspectNotice(page);
+      if (submitted && submitOrder && pageKind(url.href) === 'confirm') {
+        const result = await page.evaluate(() => {
+          let text = document.body?.innerText || '';
+          document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog[open], .next-dialog, .ant-modal, .el-message-box').forEach(node => { if (node.innerText) text = text.replace(node.innerText, ''); });
+          return /收银台|订单支付|等待买家付款|订单提交成功|订单已提交/.test(text);
+        });
+        if (!result) {
+          const recovery = await recoverSubmissionDialog(page, run, progress, report, { submissionRetryDelayMs, submissionRetryLimit: 50 });
+          if (recovery?.stop) return { state: 'uncertain', message: recovery.stop };
+          if (recovery?.retry) { progress.retrySubmission = true; deadline = Date.now() + timeoutMs; }
+        }
+      }
+      const notice = await inspectNotice(page, { checkoutErrors: pageKind(url.href) === 'cart' && progress.pending === 'cart' });
       if (notice) {
         const recovery = await recoverNotice(page, notice, run, progress, submitted ? 'submit' : progress.pending, report, { retryDelays, queueTimeoutMs });
         if (recovery.stop) return { state: submitted ? 'uncertain' : 'handoff', message: recovery.stop };
@@ -118,10 +159,10 @@ export async function continueTmallCheckout(page, run, report, { submitOrder = f
       if (kind === 'cart' && progress.retryCart && !submitted) {
         const cartButtons = await visibleActions(page, checkoutNames);
         if (cartButtons.length !== 1) return { state: 'handoff', message: '重试结算按钮不明确，请手动核查' };
-        await checkTmallAction(page, cartButtons[0], { submitOrder });
+        const retryButton = await prepareTmallAction(page, cartButtons[0], { submitOrder }, run);
         if (run.cancelled) continue;
         progress.retryCart = false;
-        await cartButtons[0].click({ timeout: 1500, noWaitAfter: true });
+        await retryButton.click({ timeout: 1500, noWaitAfter: true });
         await wait(pollMs);
         continue;
       } else if (kind !== 'cart') progress.retryCart = false;
@@ -139,13 +180,14 @@ export async function continueTmallCheckout(page, run, report, { submitOrder = f
         if (buttons.length > 1) return { state: 'handoff', message: '发现多个提交订单按钮，请手动选择' };
         if (buttons.length === 1) {
           if (!submitOrder) return { state: 'reviewOrder', message: '已到确认订单页，请核对商品、地址和金额后手动提交' };
-          if (!submitted && await buttons[0].isEnabled()) {
+          if ((!submitted || progress.retrySubmission) && await buttons[0].isEnabled()) {
             await checkTmallAction(page, buttons[0], { submitOrder });
             if (run.cancelled) continue;
             // Mark before clicking. A timeout or unchanged page never retries.
             submitted = progress.submitted = true;
             progress.pending = 'submit';
-            report('正在提交订单一次；付款由你本人完成');
+            progress.retrySubmission = false;
+            report('正在提交订单；出现弹框时最多额外重试 50 次，付款由你本人完成');
             try { await buttons[0].click({ timeout: 1500, noWaitAfter: true }); }
             catch { return { state: 'uncertain', message: '订单提交结果不明确，请核查订单；不会重复提交' }; }
           }

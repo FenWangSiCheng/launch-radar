@@ -41,8 +41,8 @@ struct Dashboard: View {
                 Text("购买页面").font(.title3.weight(.semibold))
                 Text("\(model.tasks.filter(\.enabled).count) 个参与任务").foregroundStyle(.secondary)
                 Spacer()
-                Button("添加演练", systemImage: "flask") { model.addDemo() }
                 Button("天猫苹果旗舰店", systemImage: "bag") { purchaseEntry = .tmall }
+                Button("京东购物车", systemImage: "cart") { purchaseEntry = .jd }
                 Button("抖音苹果旗舰店", systemImage: "iphone") { purchaseEntry = .douyin }
                 Button("添加页面", systemImage: "plus") { purchaseEntry = .browser }
             }.disabled(model.running)
@@ -152,9 +152,9 @@ struct Dashboard: View {
                 ContentUnavailableView {
                     Label("先准备你的购买页面", systemImage: "safari")
                 } description: {
-                    Text("添加商品链接，在浏览器里填好信息，再选定要定时点击的按钮。\n也可以添加三个模拟平台，先试一轮。")
+                    Text("添加商品链接，在浏览器里填好信息，再选定要定时点击的按钮。")
                 } actions: {
-                    Button("添加演练页面") { model.addDemo() }
+                    Button("添加页面") { purchaseEntry = .browser }
                 }.padding(.vertical, 32)
             } else {
                 LazyVStack(spacing: 0) {
@@ -213,18 +213,22 @@ struct TaskRow: View {
                 if task.douyinHandoff == true {
                     Text("手机接力 · 到点提醒 · 下单和订单在抖音 App 中处理").font(.caption).foregroundStyle(.secondary)
                 } else {
-                if task.tmall == true {
-                    Text("天猫 · 提前勾选有货商品、核对规格和金额；付款由你本人完成")
+                if task.tmall == true || task.jd == true {
+                    Text(task.jd == true ? "京东 · 提前核对有货商品、规格、金额、默认地址和付款方式" : "天猫 · 提前勾选有货商品、核对规格和金额；付款由你本人完成")
                         .font(.caption).foregroundStyle(.secondary)
-                    Toggle("自动继续天猫结账（Chrome）", isOn: Binding(
-                        get: { task.tmallFlow ?? false },
-                        set: { task.tmallFlow = $0; model.persist() }
+                    Toggle(task.jd == true ? "自动继续京东结账（Safari / Chrome）" : "自动继续天猫结账（Chrome）", isOn: Binding(
+                        get: { task.jd == true ? (task.jdFlow ?? false) : (task.tmallFlow ?? false) },
+                        set: { if task.jd == true { task.jdFlow = $0 } else { task.tmallFlow = $0 }; model.persist() }
                     )).toggleStyle(.checkbox).font(.caption).disabled(busy)
-                    if task.tmallFlow == true {
-                        Toggle("自动提交订单（会创建真实订单，不付款）", isOn: Binding(
+                    if task.tmallFlow == true || task.jdFlow == true {
+                        Toggle("自动创建订单（点击立即支付，付款由本人完成）", isOn: Binding(
                             get: { task.submitOrder ?? false },
                             set: { task.submitOrder = $0; model.persist() }
                         )).toggleStyle(.checkbox).font(.caption).disabled(busy)
+                    }
+                    if task.jd == true {
+                        Text("勾选后会按已选地址和付款方式点击「立即支付」创建订单；出现弹框时关闭并最多额外重试 50 次，进入付款页后由你本人付款。")
+                            .font(.caption).foregroundStyle(.secondary)
                     }
                 }
                 Picker("浏览器", selection: Binding(
@@ -251,9 +255,9 @@ struct TaskRow: View {
             }
             Spacer(minLength: 8)
             HStack(spacing: 8) {
-                if (task.appleFlow == true || task.tmallFlow == true) && ["handoff", "uncertain"].contains(task.state) {
+                if (task.appleFlow == true || task.tmallFlow == true || task.jdFlow == true) && ["handoff", "uncertain", "reviewOrder"].contains(task.state) {
                     Button("继续结账") { model.resume(task) }.disabled(busy || !model.connected)
-                        .help("处理页面提示后核查并继续；保留重试次数，不重复提交订单")
+                        .help(task.jd == true || task.tmall == true ? "处理页面提示后核查并继续；保留重试次数，下单弹框最多额外重试 50 次" : "处理页面提示后核查并继续；保留重试次数，下单弹框最多额外重试 10 次")
                 }
                 if task.douyinHandoff == true {
                     Button("手机购买", systemImage: "qrcode") { showingMobile = true }
@@ -294,17 +298,19 @@ struct AddTaskSheet: View {
     @State private var entry: PurchaseEntry = .browser
     private var douyin: Bool { entry == .douyin }
     private var tmall: Bool { entry == .tmall }
+    private var jd: Bool { entry == .jd }
     private var purchaseURL: String? { PurchaseLink.extract(from: url) }
     private var valid: Bool {
         guard !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let parsed = purchaseURL else { return false }
         if douyin { return PurchaseLink.isDouyin(parsed) }
         if tmall { return PurchaseLink.isTmallShare(parsed) }
+        if jd { return PurchaseLink.isJDShare(parsed) }
         return true
     }
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
             Text("添加购买页面").font(.title2.weight(.semibold))
-            Text(douyin ? "保存商品分享链接，电脑到点提醒，手机抖音 App 完成购买。" : tmall ? "粘贴天猫商品分享链接，准备好规格和地址，到点点击你绑定的购买按钮。" : "人工准备信息后，工具按统一时间点击你选定的按钮。")
+            Text(douyin ? "保存商品分享链接，电脑到点提醒，手机抖音 App 完成购买。" : jd ? "打开京东购物车，准备好规格和地址，绑定购物车「全选」，到点全选后自动结算。" : tmall ? "粘贴天猫商品分享链接，准备好规格和地址，绑定购物车「全选」，到点全选后自动结算。" : "人工准备信息后，工具按统一时间点击你选定的按钮。")
                 .foregroundStyle(.secondary)
             Form {
                 Picker("购买方式", selection: $entry) {
@@ -312,10 +318,13 @@ struct AddTaskSheet: View {
                         Text(option.title).tag(option)
                     }
                 }
-                TextField("页面名称", text: $name, prompt: Text("例如：天猫 · 黑色 256GB"))
-                TextField(douyin || tmall ? "商品分享链接" : "商品链接", text: $url, prompt: Text(douyin ? "粘贴抖音复制的完整分享文字" : tmall ? "粘贴天猫/淘宝完整分享文字，需包含 https 链接" : "https://…"))
+                TextField("页面名称", text: $name, prompt: Text(jd ? "例如：京东 · 黑色 256GB" : "例如：天猫 · 黑色 256GB"))
+                TextField(douyin || tmall || jd ? "商品分享链接" : "商品链接", text: $url, prompt: Text(douyin ? "粘贴抖音复制的完整分享文字" : jd ? "粘贴京东链接或完整分享文字，需包含 https 链接" : tmall ? "粘贴天猫/淘宝完整分享文字，需包含 https 链接" : "https://…"))
                 if tmall {
                     Button("使用淘宝购物车") { url = "https://cart.taobao.com/cart.htm"; browser = .chrome }
+                }
+                if jd {
+                    Button("使用京东购物车") { url = "https://cart.jd.com/cart_index"; browser = .safari }
                 }
                 if !douyin {
                 Picker("浏览器", selection: Binding(
@@ -329,23 +338,23 @@ struct AddTaskSheet: View {
 
                 }
             }.textFieldStyle(.roundedBorder)
-            Text(douyin ? "请在抖音 App 核对店名为 Apple Store 官方旗舰店，提前选好规格和地址。此任务无需绑定网页按钮；购物车、订单和付款在手机中处理。" : tmall ? "可直接使用淘宝购物车。登录后只勾选要购买的有货商品，核对型号、颜色、容量和金额，再绑定「结算」。开启自动提交订单后，会在确认订单页提交一次，并在付款页响铃提醒你本人支付。默认停在确认订单页；缺货、金额为 0、登录或验证码需要手动处理。商品详情页使用单次点击时，请关闭自动继续结账。" : "苹果官网默认使用 Safari，其他网站默认使用 Chrome。Safari 首次使用需允许自动化和来自 Apple 事件的 JavaScript。")
+            Text(douyin ? "请在抖音 App 核对店名为 Apple Store 官方旗舰店，提前选好规格和地址。此任务无需绑定网页按钮；购物车、订单和付款在手机中处理。" : jd ? "登录后把购物车整理为本次要购买的商品，核对规格和合计金额，再绑定「全选」。默认停在结算页。开启自动创建订单后，会点击结算页的「立即支付」，保留已选地址和付款方式；出现弹框时关闭并最多额外重试 50 次，进入付款页后由你本人付款。结果不明时暂停，请本人核查订单。登录或验证码时暂停；不检查商品金额。商品详情页使用单次点击时，请关闭自动继续结账。" : tmall ? "可直接使用淘宝购物车。登录后把购物车整理为本次要购买的商品，核对型号、颜色、容量和金额，再绑定「全选」。开启自动创建订单后，会在确认订单页点击「立即支付」创建订单；出现弹框时关闭并最多额外重试 50 次，在付款页响铃提醒你本人支付。默认停在确认订单页；缺货、金额为 0、登录或验证码需要手动处理。商品详情页使用单次点击时，请关闭自动继续结账。" : "苹果官网默认使用 Safari，其他网站默认使用 Chrome。Safari 首次使用需允许自动化和来自 Apple 事件的 JavaScript。")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Spacer()
                 Button("取消") { dismiss() }.keyboardShortcut(.cancelAction)
                 Button("添加") {
-                    model.add(name: name.trimmingCharacters(in: .whitespacesAndNewlines), url: purchaseURL!, browser: browser, douyinHandoff: douyin, tmall: tmall)
+                    model.add(name: name.trimmingCharacters(in: .whitespacesAndNewlines), url: purchaseURL!, browser: browser, douyinHandoff: douyin, tmall: tmall, jd: jd)
                     dismiss()
                 }.buttonStyle(.borderedProminent).disabled(!valid).keyboardShortcut(.defaultAction)
             }
         }.padding(32).frame(width: 520).tint(Design.accent)
-            .onAppear { entry = initialEntry; updateDefaultName() }
+            .onAppear { entry = initialEntry; if entry == .jd { url = "https://cart.jd.com/cart_index" }; updateDefaultName() }
             .onChange(of: entry) { _, _ in browser = nil; updateDefaultName() }
     }
     private func updateDefaultName() {
-        guard name.isEmpty || ["天猫 · Apple 旗舰店", "抖音 · Apple Store 官方旗舰店"].contains(name) else { return }
-        name = tmall ? "天猫 · Apple 旗舰店" : douyin ? "抖音 · Apple Store 官方旗舰店" : ""
+        guard name.isEmpty || ["天猫 · Apple 旗舰店", "抖音 · Apple Store 官方旗舰店", "京东 · 购物车"].contains(name) else { return }
+        name = jd ? "京东 · 购物车" : tmall ? "天猫 · Apple 旗舰店" : douyin ? "抖音 · Apple Store 官方旗舰店" : ""
     }
 }
 

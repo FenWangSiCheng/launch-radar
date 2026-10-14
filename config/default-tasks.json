@@ -1,0 +1,54 @@
+[
+  {
+    "name": "Apple · Duo 星光白色 512GB",
+    "message": "请重新打开并绑定按钮",
+    "submitOrder": true,
+    "url": "https://www.apple.com.cn/shop/buy-iphone/iphone-duo/mk2p4ch/a",
+    "id": "CFFA64C4-FB0E-4F6E-8974-552A5BED348F",
+    "state": "idle",
+    "demo": false,
+    "enabled": false,
+    "appleFlow": true
+  },
+  {
+    "name": "验证 · iPhone 18 Pro Max",
+    "message": "请重新打开并绑定按钮",
+    "submitOrder": true,
+    "url": "https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro/mjyd4ch/a",
+    "id": "3B850116-18D3-4BD3-A1F8-CB5CD9580184",
+    "state": "idle",
+    "demo": false,
+    "enabled": false,
+    "appleFlow": true
+  },
+  {
+    "url": "https://cart.taobao.com/cart.htm",
+    "name": "天猫 · Apple 旗舰店购物车",
+    "browser": "chrome",
+    "enabled": true,
+    "submitOrder": true,
+    "douyinHandoff": false,
+    "demo": false,
+    "tmallFlow": true,
+    "state": "idle",
+    "tmall": true,
+    "message": "请重新打开并绑定按钮",
+    "id": "D1BF5712-1BC4-4DD6-8EC6-6FE0BBC25034",
+    "appleFlow": false
+  },
+  {
+    "id": "F9BC1235-0A84-4E3B-A42C-8B3F31EC675A",
+    "name": "京东 · 购物车",
+    "url": "https://cart.jd.com/cart_index",
+    "browser": "safari",
+    "enabled": false,
+    "submitOrder": false,
+    "demo": false,
+    "jd": true,
+    "jdFlow": true,
+    "appleFlow": false,
+    "tmallFlow": false,
+    "state": "idle",
+    "message": "请重新打开并绑定按钮"
+  }
+]

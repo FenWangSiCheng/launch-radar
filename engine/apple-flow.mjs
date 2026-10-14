@@ -1,5 +1,5 @@
 import { setTimeout as wait } from 'node:timers/promises';
-import { inspectNotice, recoverNotice } from './checkout-recovery.mjs';
+import { inspectNotice, recoverNotice, recoverSubmissionDialog } from './checkout-recovery.mjs';
 
 export function isAppleURL(url) {
   try {
@@ -138,7 +138,7 @@ async function inspect(page, { submitOrder = false, pendingKey } = {}) {
   return { action };
 }
 
-export async function continueAppleCheckout(page, run, report, { timeoutMs = 45000, pollMs = 200, progress = { visited: new Set() }, submitOrder = false, retryDelays, queueTimeoutMs } = {}) {
+export async function continueAppleCheckout(page, run, report, { timeoutMs = 45000, pollMs = 200, progress = { visited: new Set() }, submitOrder = false, retryDelays, queueTimeoutMs, submissionRetryDelayMs } = {}) {
   const visited = progress.visited;
   let pending = progress.pending;
   let deadline = Date.now() + timeoutMs;
@@ -151,6 +151,25 @@ export async function continueAppleCheckout(page, run, report, { timeoutMs = 450
       const url = new URL(page.url());
       if (progress.submitted && url.protocol === 'https:' && (url.hostname === 'alipay.com' || url.hostname.endsWith('.alipay.com'))) return { state: 'paymentReady', message: '已到支付宝页面，请本人核对订单并完成付款' };
       if (page.url() !== page.appleDemoURL && !isAppleURL(page.url())) return { state: progress.submitted ? 'uncertain' : 'handoff', message: '页面离开苹果官网，请核查订单' };
+      if (progress.submitted) {
+        const result = await page.evaluate(() => {
+          let text = document.body?.innerText || '';
+          document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog[open], .next-dialog, .ant-modal, .el-message-box').forEach(node => { if (node.innerText) text = text.replace(node.innerText, ''); });
+          if (/订单提交成功|订单已提交|订单已生成|感谢您的订购|感谢你的订购/.test(text)) return 'orderSubmitted';
+          if (/收银台|订单支付|等待付款|等待买家付款/.test(text)) return 'paymentReady';
+        });
+        if (result) return { state: result, message: '页面显示订单已生成或已到付款页，请本人核对订单并完成付款' };
+        if (submitOrder) {
+          const recovery = await recoverSubmissionDialog(page, run, progress, report, { submissionRetryDelayMs });
+          if (recovery?.stop) return { state: 'uncertain', message: recovery.stop };
+          if (recovery?.retry) {
+            progress.retrySubmission = true;
+            visited.delete('submit');
+            pending = progress.pending = undefined;
+            deadline = Date.now() + timeoutMs;
+          }
+        }
+      }
       const notice = await inspectNotice(page);
       if (notice) {
         const recovery = await recoverNotice(page, notice, run, progress, pending?.split('|').at(-1), report, { retryDelays, queueTimeoutMs });
@@ -164,15 +183,11 @@ export async function continueAppleCheckout(page, run, report, { timeoutMs = 450
           deadline = Date.now() + timeoutMs;
         }
       } else { progress.queueStarted = undefined; progress.queueReported = false; }
-      if (progress.submitted) {
-        const result = await page.evaluate(() => {
-          const text = document.body?.innerText || '';
-          if (/订单提交成功|订单已提交|订单已生成|感谢您的订购|感谢你的订购/.test(text)) return 'orderSubmitted';
-          if (/收银台|订单支付|等待付款|等待买家付款/.test(text)) return 'paymentReady';
-        });
-        if (result) return { state: result, message: '页面显示订单已生成或已到付款页，请本人核对订单并完成付款' };
-        state = {};
-      } else state = await inspect(page, { submitOrder, pendingKey: pending?.split('|').at(-1) });
+      if (progress.submitted && !progress.retrySubmission) state = {};
+      else {
+        state = await inspect(page, { submitOrder, pendingKey: pending?.split('|').at(-1) });
+        if (progress.submitted && state.action && state.action.key !== 'submit') state = {};
+      }
     }
     catch (error) {
       // Navigation can destroy the execution context between observations.
@@ -196,11 +211,11 @@ export async function continueAppleCheckout(page, run, report, { timeoutMs = 450
           pending = signature;
           progress.pending = signature;
           report(`正在${action.name}`);
-          if (action.key === 'submit') progress.submitted = true;
+          if (action.key === 'submit') { progress.submitted = true; progress.retrySubmission = false; }
           try { await action.button.click({ timeout: 1500, noWaitAfter: true }); }
           catch { return { state: progress.submitted ? 'uncertain' : 'handoff', message: `${action.name}的结果不明确，已暂停；请手动核查，不会重试` }; }
-          if (action.key === 'submit') report('已发出下单点击，正在确认订单结果；不会重复提交');
-          count++;
+          if (action.key === 'submit') report('已发出下单点击，正在确认订单结果；出现弹框时最多重试 10 次');
+          if (action.key !== 'submit') count++;
           deadline = Date.now() + timeoutMs;
         }
       }

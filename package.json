@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "node --test tests/*.test.mjs",
-    "test:browser": "node tests/browser.mjs && node tests/apple-flow.browser.mjs && node tests/tmall-flow.browser.mjs && node tests/checkout-recovery.browser.mjs",
+    "test:browser": "node tests/browser.mjs && node tests/apple-flow.browser.mjs && node tests/tmall-flow.browser.mjs && node tests/jd-flow.browser.mjs && node tests/cart-flow.browser.mjs && node tests/checkout-recovery.browser.mjs",
     "browser:install": "PLAYWRIGHT_BROWSERS_PATH=engine/browsers playwright install chromium",
     "build": "bash scripts/build.sh",
     "package": "bash scripts/package.sh",

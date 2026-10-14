@@ -77,6 +77,9 @@ export class SafariPage {
   frames() { return [this]; }
   async $(selector) { return (await this.locator(selector).all())[0]; }
   locator(selector) { return new SafariLocator(this, [{ selector }]); }
+  getByText(text, { exact = false } = {}) {
+    return new SafariLocator(this, [{ text: text instanceof RegExp ? { source: text.source, flags: text.flags } : { text }, exact }]);
+  }
   getByRole(role, { name }) {
     return new SafariLocator(this, [{ role, name: name instanceof RegExp ? { source: name.source, flags: name.flags } : { text: name } }]);
   }
@@ -85,19 +88,42 @@ export class SafariPage {
 class SafariLocator {
   constructor(page, queries) { this.page = page; this.queries = queries; }
   or(other) { return new SafariLocator(this.page, [...this.queries, ...other.queries]); }
+  filter({ hasText }) {
+    const filter = hasText instanceof RegExp ? { source: hasText.source, flags: hasText.flags } : { text: hasText };
+    return new SafariLocator(this.page, this.queries.map(query => ({ ...query, hasText: filter })));
+  }
+  first() {
+    const first = async () => {
+      const element = (await this.all())[0];
+      if (!element) throw new Error('找不到目标按钮');
+      return element;
+    };
+    return {
+      click: async options => (await first()).click(options),
+      evaluate: async (fn, arg) => (await first()).evaluate(fn, arg)
+    };
+  }
   async all() {
     const ids = await this.page.evaluate(queries => {
       const registry = window.__radarRegistry ??= { elements: new Map(), ids: new WeakMap(), nonce: `${Date.now()}-${Math.random()}`, next: 0 };
       const found = new Set();
+      const matches = (text, pattern, exact = false) => pattern.source !== undefined
+        ? new RegExp(pattern.source, pattern.flags).test(text)
+        : exact ? text === pattern.text : text.includes(pattern.text);
       for (const query of queries) {
-        const selector = query.selector || (query.role === 'button' ? 'button, input[type="submit"], input[type="button"], [role="button"]' : 'a[href], [role="link"]');
+        const selector = query.selector || (query.text ? 'body *' : query.role === 'button' ? 'button, input[type="submit"], input[type="button"], [role="button"]' : 'a[href], [role="link"]');
         for (const element of document.querySelectorAll(selector)) {
-          if (!query.selector) {
+          if (query.text) {
+            const text = (element.innerText || element.textContent || '').trim();
+            if (!matches(text, query.text, query.exact)) continue;
+            if ([...element.children].some(child => matches((child.innerText || child.textContent || '').trim(), query.text, query.exact))) continue;
+          } else if (!query.selector) {
             const role = element.getAttribute('role');
             if (role && role !== query.role) continue;
             const label = element.getAttribute('aria-label') || element.innerText || element.textContent || element.value || '';
             if (query.name.source ? !new RegExp(query.name.source, query.name.flags).test(label.trim()) : label.trim() !== query.name.text) continue;
           }
+          if (query.hasText && !matches(element.textContent || '', query.hasText)) continue;
           found.add(element);
         }
       }
@@ -112,17 +138,40 @@ class SafariLocator {
     return ids.map(id => new SafariElement(this.page, id));
   }
   async innerText() { const element = (await this.all())[0]; if (!element) throw new Error('找不到目标按钮'); return element.innerText(); }
+  async evaluateAll(fn, arg) {
+    const elements = await this.all();
+    const evaluateElements = new Function('input', `
+      const elements = input.ids.map(id => window.__radarRegistry?.elements.get(id)).filter(Boolean);
+      return (${fn.toString()})(elements, input.arg);
+    `);
+    return this.page.evaluate(evaluateElements, { ids: elements.map(element => element.id), arg });
+  }
 }
 
 class SafariElement {
   constructor(page, id) { this.page = page; this.id = id; }
-  async evaluate(fn) {
-    const evaluateElement = new Function('id', `
+  async evaluate(fn, arg) {
+    const evaluateElement = new Function('input', `
+      const {id, arg} = input;
       const element = window.__radarRegistry?.elements.get(id);
       if (!element) throw new Error('目标按钮已失效，请重新绑定');
-      return (${fn.toString()})(element);
+      return (${fn.toString()})(element, arg);
     `);
-    return this.page.evaluate(evaluateElement, this.id);
+    return this.page.evaluate(evaluateElement, { id: this.id, arg });
+  }
+
+  async evaluateHandle(fn, arg) {
+    const id = await this.evaluate((element, { source, arg }) => {
+      const result = new Function('element', 'arg', `return (${source})(element, arg)`)(element, arg);
+      if (!(result instanceof Element)) throw new Error('目标不是页面元素');
+      const registry = window.__radarRegistry;
+      if (!registry.ids.has(result)) {
+        const id = `${registry.nonce}-${registry.next++}`;
+        registry.ids.set(result, id); registry.elements.set(id, result);
+      }
+      return registry.ids.get(result);
+    }, { source: fn.toString(), arg });
+    return { asElement: () => new SafariElement(this.page, id) };
   }
 
   async innerText() { return this.evaluate(element => element.innerText || element.value || ''); }

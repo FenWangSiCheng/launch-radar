@@ -11,6 +11,8 @@ cp .build/release/LaunchRadar "$app/Contents/MacOS/LaunchRadar"
 cp "$(command -v node)" "$app/Contents/Resources/runtime/node"
 cp -R engine "$app/Contents/Resources/"
 cp -R node_modules "$app/Contents/Resources/"
+cp package.json "$app/Contents/Resources/"
+cp config/default-tasks.json "$app/Contents/Resources/"
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

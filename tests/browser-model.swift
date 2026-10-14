@@ -9,6 +9,7 @@ struct BrowserModelTests {
         assert(task.submitOrder != true, "旧任务不能自动开启下单")
         assert(task.tmall != true, "旧任务不能自动变成天猫任务")
         assert(task.tmallFlow != true, "旧任务不能自动开启天猫结账")
+        assert(task.jd != true && task.jdFlow != true, "旧任务不能自动开启京东结账")
         task.browser = .chrome
         task.submitOrder = true
         let restored = try JSONDecoder().decode(PurchaseTask.self, from: JSONEncoder().encode(task))
@@ -33,6 +34,34 @@ struct BrowserModelTests {
         assert(savedTmall.tmall == true && savedTmall.selectedBrowser == .chrome)
         assert(savedTmall.tmallFlow == true)
         assert(savedTmall.appleFlow != true && savedTmall.submitOrder != true)
+        for url in ["https://cart.jd.com/cart_index", "https://item.jd.com/100.html", "https://u.jd.com/example", "https://3.cn/example"] {
+            assert(PurchaseLink.isJDShare(url))
+        }
+        for url in ["https://jd.com.attacker.test", "https://fakejd.com", "https://jd.com@attacker.test", "http://cart.jd.com/cart_index", "https://tmall.com", "invalid"] {
+            assert(!PurchaseLink.isJDShare(url))
+        }
+        let jdTask = PurchaseTask(name: "京东", url: "https://cart.jd.com/cart_index", jd: true, jdFlow: true)
+        let savedJD = try JSONDecoder().decode(PurchaseTask.self, from: JSONEncoder().encode(jdTask))
+        assert(savedJD.jd == true && savedJD.jdFlow == true && savedJD.selectedBrowser == .safari)
+        for url in ["https://jd.com.attacker.test", "https://fakejd.com", "http://jd.com"] {
+            assert(PurchaseBrowser.defaultBrowser(for: url) == .chrome)
+        }
+        assert(savedJD.submitOrder != true && savedJD.appleFlow != true && savedJD.tmallFlow != true)
+        let suiteName = "LaunchRadarTests.\(UUID().uuidString)"
+        let preferences = UserDefaults(suiteName: suiteName)!
+        defer { preferences.removePersistentDomain(forName: suiteName) }
+        let defaultsURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("config/default-tasks.json")
+        let defaults = PurchaseTaskStore.load(preferences: preferences, defaultsURL: defaultsURL)
+        assert(defaults.count == 4, "首次安装应加载四个预置页面")
+        assert(defaults.filter(\.enabled).count == 1)
+        assert(defaults.allSatisfy { $0.state == "idle" && $0.delayMs == nil })
+        assert(defaults.filter { $0.jd != true }.allSatisfy { $0.submitOrder == true }, "保留当前下单选项")
+        assert(defaults.filter { $0.jd == true }.allSatisfy { !$0.enabled && $0.submitOrder != true && $0.jdFlow == true })
+        preferences.set(try JSONEncoder().encode([savedTmall]), forKey: "tasks")
+        let local = PurchaseTaskStore.load(preferences: preferences, defaultsURL: defaultsURL)
+        assert(local.count == 1 && local[0].id == savedTmall.id, "已有列表优先于预置页面")
+        preferences.set(Data("[]".utf8), forKey: "tasks")
+        assert(PurchaseTaskStore.load(preferences: preferences, defaultsURL: defaultsURL).isEmpty, "主动删除全部页面后不应恢复默认列表")
         print("PASS: browser defaults, legacy migration, explicit selection persistence and domain boundaries")
     }
 }

@@ -18,7 +18,6 @@ Launch Radar 安装说明
 
 应用已包含 Node 和专用 Chromium，无需安装开发环境。
 首次使用 Safari 时，请允许应用控制 Safari，并按应用提示开启网页脚本权限。
-建议先点击「添加演练」熟悉操作。
 TEXT
 arch="$(uname -m)"
 hdiutil create -volname "Launch Radar" -srcfolder "$stage" -format UDZO -ov "dist/Launch-Radar-macOS-$arch.dmg"

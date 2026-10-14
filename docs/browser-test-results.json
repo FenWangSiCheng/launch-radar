@@ -1,21 +1,21 @@
 {
-  "testedAt": "2026-10-13T08:05:52.047Z",
+  "testedAt": "2026-10-14T09:33:56.965Z",
   "environment": "local headless Chromium; simulated checkout only",
   "timing": [
     {
       "platform": "2",
-      "dispatchDelayMs": 9,
-      "actualClickDelayMs": 44
-    },
-    {
-      "platform": "0",
-      "dispatchDelayMs": 8,
-      "actualClickDelayMs": 44
+      "dispatchDelayMs": 6,
+      "actualClickDelayMs": 40
     },
     {
       "platform": "1",
-      "dispatchDelayMs": 8,
-      "actualClickDelayMs": 44
+      "dispatchDelayMs": 6,
+      "actualClickDelayMs": 40
+    },
+    {
+      "platform": "0",
+      "dispatchDelayMs": 5,
+      "actualClickDelayMs": 40
     }
   ],
   "checks": [
@@ -33,6 +33,11 @@
     "manual trigger replaces timer without duplicate execution",
     "Tmall checkout submits once and stops before payment",
     "Tmall checkout supports a new order tab without duplicate submission",
-    "Tmall unknown post-submit notice pauses and resumes without resubmission"
+    "Tmall unknown post-submit notice pauses and resumes without resubmission",
+    "JD div binding does not checkout",
+    "JD scheduled checkout supports same-tab and popup navigation",
+    "JD submission guard survives resume",
+    "JD default stops at confirmation",
+    "JD submission checkbox clicks integrated payment once and preserves resume guard"
   ]
 }

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { chromium } from 'playwright';
 import { SafariPage, browserChoice, pickScript } from '../engine/safari.mjs';
 import { continueAppleCheckout, initialAppleProgress } from '../engine/apple-flow.mjs';
+import { resolveJDButton, prepareJDAction, continueJDCheckout } from '../engine/jd-flow.mjs';
 
 assert.equal(browserChoice({ browser: 'safari' }), 'safari');
 assert.equal(browserChoice({ browser: 'chrome' }), 'chrome');
@@ -83,5 +84,32 @@ try {
   await page.refreshURL();
   assert.notEqual(page.url(), picked.url);
   await assert.rejects(first.evaluate(element => element.isConnected), /失效/);
-  console.log('PASS: Safari adapter binding, trial click, disabled button, overlay, stale target, cancel, Apple multi-step checkout and final-order protection (Chromium transport)');
+  // JD's div control can be picked on its nested count. Exercise the actual
+  // Safari adapter through selection, navigation, dialog retry and resume.
+  const cart = 'https://cart.jd.com/cart_index';
+  const confirm = 'https://trade.jd.com/shopping/order/getOrderInfo.action';
+  await native.route('https://cart.jd.com/**', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<label><input type="checkbox">全选</label><p>合计:￥12999.00</p><div class="_submitBtn_test" onclick="location.href='${confirm}'">去结算 <span id="count">(1)</span></div>` }));
+  await native.route('https://trade.jd.com/**', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: `<p>升级公告：如需使用原收银台完成支付，可选择更多支付进入。</p><p>应付总额:￥12999.00</p><div class="payment-action-submit"><button id="submit">立即支付</button></div><script>window.submissions=0;submit.onclick=()=>{submissions++;if(submissions===1)document.body.insertAdjacentHTML('beforeend','<div role="dialog">繁忙<button onclick="this.parentElement.remove()">关闭</button></div>');else document.body.insertAdjacentHTML('beforeend','<h1>京东收银台</h1>');};</script>` }));
+  await native.goto(cart);
+  await page.refreshURL();
+  await page.evaluate(pickScript());
+  await native.locator('input[type=checkbox]').click();
+  const jdPicked = await page.evaluate(() => window.__radarPicked);
+  let jdButton = await resolveJDButton(await page.$(`[data-launch-radar="${jdPicked.token}"]`));
+  assert.equal(await jdButton.innerText(), '全选');
+  assert.equal(await native.locator('input').isChecked(), false, 'binding must not select all');
+  assert.equal(native.url(), cart, 'binding must not checkout');
+  jdButton = await prepareJDAction(page, jdButton, { submitOrder: true });
+  assert.equal(await jdButton.getAttribute('class'), '_submitBtn_test');
+  assert.equal(await native.locator('input').isChecked(), true);
+  const jdProgress = { pending: 'cart' };
+  await jdButton.click();
+  const jdResult = await continueJDCheckout(page, { cancelled: false }, () => {}, { submitOrder: true, progress: jdProgress, timeoutMs: 2000, pollMs: 10 });
+  assert.equal(jdResult.state, 'paymentReady');
+  assert.equal(page.url(), confirm, 'Safari must refresh URL after checkout navigation');
+  assert.equal(await native.evaluate(() => submissions), 2);
+  assert.equal(jdProgress.submissionRetries, 1);
+  assert.equal((await continueJDCheckout(page, { cancelled: false }, () => {}, { submitOrder: true, progress: jdProgress, timeoutMs: 100 })).state, 'paymentReady');
+  assert.equal(await native.evaluate(() => submissions), 2, 'resume must not submit again');
+  console.log('PASS: Safari adapter binding, trial click, disabled button, overlay, stale target, cancel, Apple checkout protection, JD binding/select-all/navigation/submission/retry/resume (Chromium transport)');
 } finally { await browser.close(); }

@@ -184,7 +184,7 @@ try {
     const url = new URL(route.request().url());
     const popup = url.searchParams.has('popup');
     const html = url.hostname === 'cart.taobao.com'
-      ? `<p>合计： ¥17999</p><button id="settle">结算</button><script>window.settled=0;settle.onclick=()=>{window.settled++;${popup ? "window.open('https://buy.tmall.com/order/confirm_order.htm')" : "location.href='https://buy.tmall.com/order/confirm_order.htm'"};};</script>`
+      ? `<label><input id="all" type="checkbox" onchange="window.selected=(window.selected||0)+1">全选</label><p>合计： ¥17999</p><button id="settle">结算</button><script>window.settled=0;settle.onclick=()=>{if(!all.checked)throw new Error('must select all');window.settled++;if(window.settled===1){alert('结算错误，请稍后再试');return;}${popup ? "window.open('about:blank')" : "location.href='https://buy.tmall.com/order/confirm_order.htm'"};};</script>`
       : '<h2>确认收货地址</h2><h2>确认订单信息</h2><h2>付款详情</h2><p>商品总价 ¥17999</p><style>.btn--fixture{position:relative;width:254px;height:48px;display:flex;align-items:center;justify-content:center}.btn--fixture:hover:after{content:"";position:absolute;inset:0;z-index:1}</style><div id="submitOrder"><div class="trade-buy-btn-submit"><div id="submit" class="btn--fixture"><div>立即支付 ¥17999</div></div></div></div><script>window.submissions=0;window.payments=0;submit.onclick=()=>{window.submissions++;document.body.innerHTML=\'<h1>收银台</h1><button id="pay">立即支付</button>\';pay.onclick=()=>window.payments++;};</script>';
     return route.fulfill({ contentType: 'text/html; charset=utf-8', body: html });
   });
@@ -196,12 +196,19 @@ try {
     send({ type: 'open', id, url, browser: 'chrome', tmallFlow: true, submitOrder: true });
     await event(item => item.id === id && item.state === 'opened', tmallStart);
     const cartPage = browser.contexts()[0].pages().find(page => !previousPages.has(page) && page.url() === url);
+    // Let the worker dismiss native errors; this CDP observer must not auto-dismiss them.
+    cartPage.on('dialog', () => {});
     send({ type: 'pick', id });
     await event(item => item.id === id && item.state === 'picking', tmallStart);
-    await cartPage.locator('#settle').click();
+    await cartPage.locator('#all').click();
     await event(item => item.id === id && item.state === 'bound', tmallStart);
     assert.equal(await cartPage.evaluate(() => window.settled), 0);
+    assert.equal(await cartPage.locator('#all').isChecked(), false, 'binding must not select all');
+    // Attach the test client before navigating the popup so its first request
+    // is always mocked; CDP can otherwise attach after the initial request.
+    const popupPage = popup ? browser.contexts()[0].waitForEvent('page') : null;
     send({ type: 'runNow', ids: [id], tmallFlows: { [id]: true }, submitOrders: { [id]: true } });
+    if (popupPage) await (await popupPage).goto('https://buy.tmall.com/order/confirm_order.htm');
     await event(item => item.id === id && item.state === 'paymentReady', tmallStart);
     await event(item => item.type === 'finished', tmallStart);
     const orderPage = browser.contexts()[0].pages().find(page => !previousPages.has(page) && page.url().includes('buy.tmall.com'));
@@ -226,8 +233,60 @@ try {
     await event(item => item.type === 'error', repeated);
     assert.equal(await orderPage.evaluate(() => window.submissions), 1);
   }
-  await writeFile('docs/browser-test-results.json', JSON.stringify({ testedAt: new Date().toISOString(), environment: 'local headless Chromium; simulated checkout only', timing, checks: ['binding does not submit', 'three pages submit once', 'duplicate arm rejected', 'clicked tasks cannot rearm without rebinding', 'cancel prevents click', 'detached button fails', 'disabled button waits for enablement', 'Apple follow-up stops before order submission', 'Apple final primary button rejected', 'Apple missing address pauses and resumes after filling', 'manual run dispatches immediately', 'manual trigger replaces timer without duplicate execution', 'Tmall checkout submits once and stops before payment', 'Tmall checkout supports a new order tab without duplicate submission', 'Tmall unknown post-submit notice pauses and resumes without resubmission'] }, null, 2));
-  console.log(JSON.stringify({ result: 'PASS', timing, checks: 15 }, null, 2));
+  // JD uses a div checkout control with a nested count in the live cart.
+  await browser.contexts()[0].route(/^https:\/\/(cart\.jd\.com|trade\.jd\.com)\//, route => {
+    const url = new URL(route.request().url());
+    const mode = url.searchParams.get('mode') || 'legacy';
+    const popup = url.searchParams.has('popup');
+    const destination = `https://trade.jd.com/shopping/order/getOrderInfo.action?mode=${mode}`;
+    const html = url.hostname === 'cart.jd.com'
+      ? `<label><input id="all" type="checkbox" onchange="window.selected=(window.selected||0)+1">全选</label><p>合计:￥12,999.00</p><p>商品总额:￥12,999.00</p><div id="settle" class="_submitBtn_fixture">去结算 &nbsp;<span id="caption">(1)</span></div><script>window.settled=0;settle.onclick=()=>{if(!all.checked)throw new Error('must select all');window.settled++;if(window.settled===1){alert('结算错误，请稍后再试');return;}${popup ? "window.open('about:blank')" : `location.href='${destination}'`};};</script>`
+      : mode === 'integrated'
+        ? '<span>商品结算</span><em>付款详情</em><em>商品总额</em><div>￥12999.00</div><div class="payment-action-submit"><button onclick="window.payments=(window.payments||0)+1;document.body.insertAdjacentHTML(\'beforeend\',\'<h1>京东收银台</h1>\')">立即支付</button></div>'
+        : '<p>应付总额：￥12999.00</p><button id="order-submit"><span>提交订单</span></button><script>window.submissions=0;window.payments=0;document.querySelector("#order-submit").onclick=()=>{window.submissions++;document.body.innerHTML=\'<h1>京东收银台</h1><button onclick="window.payments++">立即支付</button>\';};</script>';
+    return route.fulfill({ contentType: 'text/html; charset=utf-8', body: html });
+  });
+  for (const { mode, popup, submitOrder } of [{ mode: 'legacy', popup: false, submitOrder: true }, { mode: 'legacy', popup: true, submitOrder: true }, { mode: 'legacy', popup: false, submitOrder: false }, { mode: 'integrated', popup: false, submitOrder: true }, { mode: 'integrated', popup: false, submitOrder: false }]) {
+    const start = events.length;
+    const id = `jd-${mode}-${popup}-${submitOrder}`;
+    const url = `https://cart.jd.com/cart_index?mode=${mode}${popup ? '&popup=1' : ''}`;
+    const previous = new Set(browser.contexts()[0].pages());
+    send({ type: 'open', id, url, browser: 'chrome', jdFlow: true, submitOrder });
+    await event(item => item.id === id && item.state === 'opened', start);
+    const cartPage = browser.contexts()[0].pages().find(page => !previous.has(page) && page.url() === url);
+    // Let the worker dismiss native errors; this CDP observer must not auto-dismiss them.
+    cartPage.on('dialog', () => {});
+    send({ type: 'pick', id });
+    await event(item => item.id === id && item.state === 'picking', start);
+    await cartPage.locator(mode === 'legacy' ? '#all' : '#caption').click();
+    await event(item => item.id === id && item.state === 'bound', start);
+    assert.equal(await cartPage.evaluate(() => window.settled), 0);
+    assert.equal(await cartPage.locator('#all').isChecked(), false, 'binding must not select all');
+    const popupPage = popup ? browser.contexts()[0].waitForEvent('page') : null;
+    send({ type: 'arm', ids: [id], jdFlows: { [id]: true }, submitOrders: { [id]: submitOrder }, target: Date.now() + 1500 });
+    await event(item => item.type === 'armed', start);
+    assert.equal(await cartPage.locator('#all').isChecked(), false, 'arming must not select all');
+    if (popupPage) await (await popupPage).goto(`https://trade.jd.com/shopping/order/getOrderInfo.action?mode=${mode}`);
+    const state = submitOrder ? 'paymentReady' : 'reviewOrder';
+    await event(item => item.id === id && item.state === state, start);
+    await event(item => item.type === 'finished', start);
+    const orderPage = browser.contexts()[0].pages().find(page => !previous.has(page) && page.url().includes('trade.jd.com'));
+    assert.equal(await orderPage.evaluate(() => window.payments || 0), mode === 'integrated' && submitOrder ? 1 : 0);
+    assert.equal(await orderPage.evaluate(() => window.submissions || 0), mode === 'legacy' && submitOrder ? 1 : 0);
+    if (state === 'paymentReady') {
+      const resumed = events.length;
+      send({ type: 'resume', id });
+      await event(item => item.id === id && item.state === 'paymentReady', resumed);
+      await event(item => item.type === 'finished', resumed);
+      assert.equal(await orderPage.evaluate(() => window.submissions || 0), mode === 'legacy' ? 1 : 0);
+    }
+    const repeat = events.length;
+    send({ type: 'runNow', ids: [id] });
+    await event(item => item.type === 'error', repeat);
+    assert.equal(await orderPage.evaluate(() => window.payments || 0), mode === 'integrated' && submitOrder ? 1 : 0);
+  }
+  await writeFile('docs/browser-test-results.json', JSON.stringify({ testedAt: new Date().toISOString(), environment: 'local headless Chromium; simulated checkout only', timing, checks: ['binding does not submit', 'three pages submit once', 'duplicate arm rejected', 'clicked tasks cannot rearm without rebinding', 'cancel prevents click', 'detached button fails', 'disabled button waits for enablement', 'Apple follow-up stops before order submission', 'Apple final primary button rejected', 'Apple missing address pauses and resumes after filling', 'manual run dispatches immediately', 'manual trigger replaces timer without duplicate execution', 'Tmall checkout submits once and stops before payment', 'Tmall checkout supports a new order tab without duplicate submission', 'Tmall unknown post-submit notice pauses and resumes without resubmission', 'JD div binding does not checkout', 'JD scheduled checkout supports same-tab and popup navigation', 'JD submission guard survives resume', 'JD default stops at confirmation', 'JD submission checkbox clicks integrated payment once and preserves resume guard'] }, null, 2));
+  console.log(JSON.stringify({ result: 'PASS', timing, checks: 21 }, null, 2));
 } finally {
   send({ type: 'shutdown' });
   await new Promise(resolve => { worker.on('exit', resolve); setTimeout(() => { worker.kill(); resolve(); }, 4000).unref(); });
