@@ -1,21 +1,21 @@
 {
-  "testedAt": "2026-10-16T04:19:33.720Z",
+  "testedAt": "2026-10-16T06:38:22.199Z",
   "environment": "local headless Chromium; simulated checkout only",
   "timing": [
     {
-      "platform": "2",
+      "platform": "0",
       "dispatchDelayMs": 5,
-      "actualClickDelayMs": 42
+      "actualClickDelayMs": 39
+    },
+    {
+      "platform": "2",
+      "dispatchDelayMs": 7,
+      "actualClickDelayMs": 39
     },
     {
       "platform": "1",
-      "dispatchDelayMs": 4,
-      "actualClickDelayMs": 45
-    },
-    {
-      "platform": "0",
-      "dispatchDelayMs": 4,
-      "actualClickDelayMs": 46
+      "dispatchDelayMs": 6,
+      "actualClickDelayMs": 39
     }
   ],
   "checks": [

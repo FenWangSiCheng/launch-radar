@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { SafariPage, browserChoice, pickScript } from './safari.mjs';
 import { fileURLToPath } from 'node:url';
 import { Scheduler } from './scheduler.mjs';
-import { continueAppleCheckout, initialAppleProgress, isAppleURL, waitForAppleRelease } from './apple-flow.mjs';
+import { continueAppleCheckout, initialAppleProgress, isAppleReleaseURL, isAppleURL, prepareAppleRelease } from './apple-flow.mjs';
 import { checkTmallAction, prepareTmallAction, prepareTmallCartAtRelease, continueTmallCheckout, resolveTmallButton, isTmallCartURL } from './tmall-flow.mjs';
 import { checkJDAction, prepareJDAction, prepareJDCartAtRelease, continueJDCheckout, resolveJDButton, isJDCartURL } from './jd-flow.mjs';
 import { observeJDCartRequests } from './jd-diagnostics.mjs';
@@ -143,7 +143,9 @@ async function openTask(command) {
     tasks.set(task.id, task);
     status(task.id, 'opened', task.jdFlow && isJDCartURL(page.url())
       ? '京东购物车已打开；到点将刷新、全选并结算，无需绑定按钮'
-      : 'Safari 已打开；请人工准备信息，再点击「选按钮」');
+      : task.appleFlow && isAppleReleaseURL(page.url())
+        ? '苹果商品页已打开；到点刷新页面并按默认配置重试开售，无需绑定按钮'
+        : 'Safari 已打开；请人工准备信息，再点击「选按钮」');
     return;
   }
   const session = await browser();
@@ -198,7 +200,9 @@ async function openTask(command) {
   await page.bringToFront();
   status(task.id, 'opened', (task.tmallFlow && isTmallCartURL(page.url()) || task.jdFlow && isJDCartURL(page.url()))
     ? '请核对购物车商品和规格；到点将刷新、全选并结算，无需绑定按钮'
-    : '请人工准备信息，再点击「选按钮」');
+    : task.appleFlow && isAppleReleaseURL(page.url())
+      ? '苹果商品页已打开；到点刷新页面并按默认配置重试开售，无需绑定按钮'
+      : '请人工准备信息，再点击「选按钮」');
 }
 
 async function pickButton(id) {
@@ -284,7 +288,9 @@ async function checkTask(task) {
   if (!task || task.page.isClosed()) throw new Error('存在未打开或已关闭的任务');
   const tmallCart = task.tmallFlow && isTmallCartURL(task.page.url());
   const jdCart = task.jdFlow && isJDCartURL(task.page.url());
-  if (!task.button && !tmallCart && !jdCart) throw new Error('存在未绑定的任务');
+  // 苹果商品页到点由工具刷新并重新解析开售按钮，不需要预先绑定。
+  const appleRelease = task.appleFlow === true && isAppleReleaseURL(task.page.url());
+  if (!task.button && !tmallCart && !jdCart && !appleRelease) throw new Error('存在未绑定的任务');
   if (task.clicked) throw new Error('该任务已经点击过，请人工核查订单并重新绑定');
   if (task.button && task.page.url() !== task.boundURL) throw new Error('页面已经变化，请重新绑定按钮');
   if (task.appleFlow && task.page.url() !== task.page.appleDemoURL && !isAppleURL(task.page.url())) throw new Error('后续步骤仅适用于苹果官网，请关闭该选项或打开苹果页面');
@@ -296,12 +302,12 @@ async function checkTask(task) {
     if (task.appleFlow || task.tmallFlow) throw new Error('京东自动流程请关闭其他平台结账');
     if (!jdCart) await checkJDAction(task.page, task.button, { binding: true });
   }
-  if (task.appleFlow) {
+  if (task.appleFlow && task.button) {
     await initialAppleProgress(task.button, task.page.url());
   }
-  if (tmallCart || jdCart) {
+  if (tmallCart || jdCart || appleRelease) {
     task.boundURL = task.page.url();
-    status(task.id, 'ready', `${jdCart ? '京东' : '淘宝'}购物车已就绪；到点刷新并尝试全选，最多 1 分钟`);
+    status(task.id, 'ready', appleRelease ? '已就绪；到点刷新页面并按默认配置重试开售，最多 1 分钟' : `${jdCart ? '京东' : '淘宝'}购物车已就绪；到点刷新并尝试全选，最多 1 分钟`);
     return;
   }
   const connected = await task.button.evaluate(element => element.isConnected);
@@ -309,8 +315,7 @@ async function checkTask(task) {
   // A trial click checks overlays and scrolls the target into view without submitting.
   const enabled = await task.button.isEnabled();
   if (enabled) await task.button.click({ trial: true, timeout: 2000 });
-  const releaseWait = task.appleFlow && /\/shop\/buy-iphone\//.test(new URL(task.page.url()).pathname);
-  status(task.id, 'ready', enabled ? '按钮检查通过，等待触发' : releaseWait ? '按钮当前禁用；到点等待开售，最多 120 秒' : '按钮当前禁用；到点最多等待 1.5 秒，请确认页面能自动更新开售状态');
+  status(task.id, 'ready', enabled ? '按钮检查通过，等待触发' : '按钮当前禁用；到点最多等待 1.5 秒，请确认页面能自动更新开售状态');
 }
 
 async function execute(task, run) {
@@ -321,18 +326,23 @@ async function execute(task, run) {
       return;
     }
     if (task.page.refreshURL) await task.page.refreshURL();
-    if (task.page.isClosed() || task.page.url() !== task.boundURL) throw new Error('页面已关闭或变化');
+    if (task.page.isClosed()) throw new Error('页面已关闭或变化');
     const tmallCart = task.tmallFlow && isTmallCartURL(task.page.url());
     const jdCart = task.jdFlow && isJDCartURL(task.page.url());
-    if (task.appleFlow && /\/shop\/buy-iphone\//.test(new URL(task.page.url()).pathname)) {
-      status(task.id, 'following', '正在等待开售按钮启用（最多 120 秒）');
-      task.button = await waitForAppleRelease(task.page, task.button, run);
+    const appleRelease = task.appleFlow && isAppleReleaseURL(task.page.url());
+    // 商品页到点会刷新，期间还可能被预购等待页接管，URL 上的查询串会变，只校验仍在商品页。
+    if (!appleRelease && task.page.url() !== task.boundURL) throw new Error('页面已关闭或变化');
+    if (appleRelease) {
+      status(task.id, 'following', '正在等待开售：刷新页面并按默认配置重试（最多 1 分钟）');
+      task.button = await prepareAppleRelease(task.page, run, {
+        report: message => status(task.id, 'following', message)
+      });
     }
     if (tmallCart || jdCart) {
       // Reload replaces the bound DOM node. Resolve controls from the refreshed
       // cart only after selection and checkout become available.
       task.button = undefined;
-    } else {
+    } else if (!appleRelease) {
       const valid = await task.button.evaluate(element => element.isConnected);
       if (!valid) throw new Error('目标按钮已失效');
     }

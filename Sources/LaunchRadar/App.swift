@@ -216,10 +216,6 @@ struct TaskRow: View {
                 } else if task.tmall == true {
                     Text(task.isTmallCart ? "淘宝购物车 · 到点刷新并尝试全选，然后去结算 → 立即支付；付款由你完成" : "天猫 · 去结算 → 立即支付；付款由你完成")
                         .font(.caption).foregroundStyle(.secondary)
-                    Toggle("自动继续天猫结账（Chrome）", isOn: Binding(
-                        get: { task.tmallFlow ?? false },
-                        set: { task.tmallFlow = $0; model.persist() }
-                    )).toggleStyle(.checkbox).font(.caption).disabled(busy)
                 }
                 Picker("浏览器", selection: Binding(
                     get: { task.selectedBrowser },
@@ -245,7 +241,7 @@ struct TaskRow: View {
             }
             Spacer(minLength: 8)
             HStack(spacing: 8) {
-                if (task.appleFlow == true || task.tmallFlow == true || task.jdFlow == true) && ["handoff", "uncertain", "reviewOrder"].contains(task.state) {
+                if (task.appleFlow == true || task.usesTmallFlow || task.usesJDFlow) && ["handoff", "uncertain", "reviewOrder"].contains(task.state) {
                     Button("继续结账") { model.resume(task) }.disabled(busy || !model.connected)
                         .help(task.jd == true || task.tmall == true ? "处理页面提示后核查并继续；去结算和立即支付异常分别最多重试 1 分钟，继续不会重新计时" : "处理页面提示后核查并继续；下单弹框最多额外重试 10 次")
                 }
@@ -253,7 +249,7 @@ struct TaskRow: View {
                     Button("手机购买", systemImage: "qrcode") { showingMobile = true }
                 } else {
                 Button("打开") { model.open(task) }.disabled(busy || !model.connected)
-                if !task.isTmallCart && !task.isJDCart {
+                if !task.isTmallCart && !task.isJDCart && !task.isAppleRelease {
                     Button("选按钮") { model.send(["type": "pick", "id": task.id]) }
                         .disabled(busy || ["idle", "closed", "opening"].contains(task.state) || !model.connected)
                 }

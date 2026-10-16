@@ -27,13 +27,25 @@ struct PurchaseTask: Identifiable, Codable {
     var submitOrder: Bool?
     var browser: PurchaseBrowser?
     var selectedBrowser: PurchaseBrowser { browser ?? (demo ? .chrome : PurchaseBrowser.defaultBrowser(for: url)) }
+    // JD and Tmall always run their platform's fixed checkout flow. Both flags
+    // are still persisted, but unlike the apple flow they have no UI switch.
+    var usesTmallFlow: Bool { tmall == true || tmallFlow == true }
+    var usesJDFlow: Bool { jd == true || jdFlow == true }
     var isTmallCart: Bool {
-        guard tmallFlow == true, selectedBrowser == .chrome, let parsed = URL(string: url) else { return false }
+        guard usesTmallFlow, selectedBrowser == .chrome, let parsed = URL(string: url) else { return false }
         return parsed.scheme == "https" && parsed.host == "cart.taobao.com" && parsed.path == "/cart.htm"
     }
     var isJDCart: Bool {
-        guard jdFlow == true, let parsed = URL(string: url), parsed.scheme == "https", parsed.host == "cart.jd.com" else { return false }
+        guard usesJDFlow, let parsed = URL(string: url), parsed.scheme == "https", parsed.host == "cart.jd.com" else { return false }
         return ["/cart_index", "/cart_index/", "/cart.action", "/cart.html"].contains(parsed.path)
+    }
+    // Apple product pages are opened and left alone: at the scheduled time the
+    // engine refreshes the page and resolves the buy control itself, so there is
+    // no preset-sale button to bind beforehand.
+    var isAppleRelease: Bool {
+        guard appleFlow == true, let parsed = URL(string: url), parsed.scheme == "https", let host = parsed.host else { return false }
+        let apple = host == "apple.com" || host == "apple.com.cn" || host.hasSuffix(".apple.com") || host.hasSuffix(".apple.com.cn")
+        return apple && parsed.path.hasPrefix("/shop/buy-iphone/")
     }
     var state = "idle"
     var message = "尚未打开"
@@ -58,9 +70,10 @@ enum PurchaseTaskStore {
         return saved.map { task in
             var copy = task
             if copy.jd == true { copy.jdFlow = true; copy.submitOrder = true }
-            // The Tmall flow always continues to the confirmation page's “立即支付”.
-            if copy.tmall == true && copy.tmallFlow == true { copy.submitOrder = true }
-            copy.state = "idle"; copy.message = copy.isTmallCart || copy.isJDCart ? "请重新打开购物车" : "请重新打开并绑定按钮"; copy.delayMs = nil
+            // The Tmall flow also has no switch: it is always on and always
+            // continues to the confirmation page's “立即支付”.
+            if copy.tmall == true { copy.tmallFlow = true; copy.submitOrder = true }
+            copy.state = "idle"; copy.message = copy.isTmallCart || copy.isJDCart ? "请重新打开购物车" : copy.isAppleRelease ? "请重新打开商品页" : "请重新打开并绑定按钮"; copy.delayMs = nil
             return copy
         }
     }
@@ -242,7 +255,7 @@ final class RadarModel: ObservableObject {
         if let index = tasks.firstIndex(where: { $0.id == task.id }) {
             tasks[index].state = "opening"; tasks[index].message = "正在打开浏览器…"; tasks[index].delayMs = nil
         }
-        send(["type": "open", "id": task.id, "url": task.url, "name": task.name, "demo": task.demo, "appleFlow": task.appleFlow ?? false, "tmallFlow": task.tmallFlow ?? false, "jdFlow": task.jd == true || task.jdFlow == true, "douyinHandoff": task.douyinHandoff ?? false, "submitOrder": task.jd == true || task.tmall == true || task.submitOrder == true, "browser": task.selectedBrowser.rawValue])
+        send(["type": "open", "id": task.id, "url": task.url, "name": task.name, "demo": task.demo, "appleFlow": task.appleFlow ?? false, "tmallFlow": task.usesTmallFlow, "jdFlow": task.usesJDFlow, "douyinHandoff": task.douyinHandoff ?? false, "submitOrder": task.jd == true || task.tmall == true || task.submitOrder == true, "browser": task.selectedBrowser.rawValue])
     }
 
     func changeBrowser(_ id: String, to browser: PurchaseBrowser) {
@@ -251,7 +264,7 @@ final class RadarModel: ObservableObject {
         send(["type": "remove", "id": id])
         tasks[index].browser = browser
         tasks[index].state = "idle"
-        tasks[index].message = tasks[index].isTmallCart || tasks[index].isJDCart ? "浏览器已切换，请重新打开购物车" : "浏览器已切换，请重新打开并绑定按钮"
+        tasks[index].message = tasks[index].isTmallCart || tasks[index].isJDCart ? "浏览器已切换，请重新打开购物车" : tasks[index].isAppleRelease ? "浏览器已切换，请重新打开商品页" : "浏览器已切换，请重新打开并绑定按钮"
         tasks[index].delayMs = nil
         persist()
     }
@@ -265,7 +278,7 @@ final class RadarModel: ObservableObject {
 
     var canArm: Bool {
         connected && !running && !tasks.filter(\.enabled).isEmpty && tasks.filter(\.enabled).allSatisfy {
-            $0.douyinHandoff == true || ["bound", "ready"].contains($0.state) || (($0.isTmallCart || $0.isJDCart) && $0.state == "opened")
+            $0.douyinHandoff == true || ["bound", "ready"].contains($0.state) || (($0.isTmallCart || $0.isJDCart || $0.isAppleRelease) && $0.state == "opened")
         }
     }
 
@@ -298,11 +311,11 @@ final class RadarModel: ObservableObject {
         phase = "正在检查各页面…"
         preventSleep()
         let selected = tasks.filter(\.enabled)
-        send(["type": type, "ids": selected.map(\.id), "douyinReminders": selected.filter { $0.douyinHandoff == true }.map { ["id": $0.id, "url": $0.url] }, "appleFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.appleFlow ?? false) }), "tmallFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.tmallFlow ?? false) }), "jdFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.jd == true || $0.jdFlow == true) }), "submitOrders": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.jd == true || $0.tmall == true || $0.submitOrder == true) }), "target": target.timeIntervalSince1970 * 1000])
+        send(["type": type, "ids": selected.map(\.id), "douyinReminders": selected.filter { $0.douyinHandoff == true }.map { ["id": $0.id, "url": $0.url] }, "appleFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.appleFlow ?? false) }), "tmallFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.usesTmallFlow) }), "jdFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.usesJDFlow) }), "submitOrders": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.jd == true || $0.tmall == true || $0.submitOrder == true) }), "target": target.timeIntervalSince1970 * 1000])
     }
 
     func resume(_ task: PurchaseTask) {
-        guard connected, !running, (task.appleFlow == true || task.tmallFlow == true || task.jdFlow == true), ["handoff", "uncertain"].contains(task.state) else { return }
+        guard connected, !running, (task.appleFlow == true || task.usesTmallFlow || task.usesJDFlow), ["handoff", "uncertain"].contains(task.state) else { return }
         running = true
         phase = "正在核查页面并继续结账"
         preventSleep()

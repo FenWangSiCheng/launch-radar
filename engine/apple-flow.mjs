@@ -8,6 +8,11 @@ export function isAppleURL(url) {
   } catch { return false; }
 }
 
+// 商品配置页的开售任务由工具自己刷新并解析购买按钮，不需要预先绑定。
+export function isAppleReleaseURL(url) {
+  try { return isAppleURL(url) && /\/shop\/buy-iphone\//.test(new URL(url).pathname); } catch { return false; }
+}
+
 // Match only known checkout actions; final submission requires an explicit task option.
 const steps = [
   { key: 'addBag', name: '加入购物袋', names: /^(添加到购物袋|加入购物袋|Add to Bag)$/i, autom: ['add-to-cart', 'add-to-bag'] },
@@ -226,28 +231,116 @@ export async function continueAppleCheckout(page, run, report, { timeoutMs = 450
   return { state: 'handoff', message: '已达到自动步骤上限，请手动核查当前页面' };
 }
 
-// A launch can replace the disabled pre-sale control. Re-resolve only the
-// product's known Add to Bag control, on the original product page.
-export async function waitForAppleRelease(page, original, run, { timeoutMs = 120000, pollMs = 100 } = {}) {
+// 苹果购买页只在加载时取一次可售状态：没有轮询、没有 WebSocket，也不监听
+// 标签页切换，页面静置时一个请求都不发。所以到点后只能由外部反复
+// 「刷新界面 → 校验默认配置 → 重新解析按钮」，并在预算内重试。
+// 开售前页面上的「继续」是写死 disabled 的占位控件，开售时会被整个替换成
+// 服务器下发的加购表单，因此不能只等它变成可点。
+const buyControlSelector = ['button', 'input[type="submit"]']
+  .flatMap(tag => [`${tag}[data-autom="add-to-cart"]`, `${tag}[data-autom="add-to-bag"]`]).join(', ');
+
+export async function prepareAppleRelease(page, run, {
+  timeoutMs = 60000,
+  settleMs = 6000,
+  dwellMs = 2500,
+  retryDelayMs = 1200,
+  expected = { color: 'starwhite', capacity: '512gb' },
+  report
+} = {}) {
   const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const left = () => Math.max(0, deadline - Date.now());
+  let reason = '购买按钮尚未出现';
+  for (let attempt = 1; Date.now() < deadline; attempt++) {
     if (run.cancelled) throw new Error('已停止等待开售');
-    if (page.refreshURL) await page.refreshURL();
-    if (!isAppleURL(page.url()) || !/\/shop\/buy-iphone\//.test(new URL(page.url()).pathname) || /[?&]step=attach/.test(page.url())) throw new Error('等待开售期间页面已离开商品配置页');
-    if (await original.evaluate(element => element.isConnected).catch(() => false)) {
-      // The page can replace the control after isConnected was observed.
-      // Treat that specific race as still waiting and resolve it next poll.
-      const enabled = await original.isVisible() && await original.isEnabled().catch(error => {
-        if (/Element is not attached to the DOM/.test(error.message)) return false;
-        throw error;
-      });
-      if (enabled) return original;
-    } else {
-      const buttons = await visible(page.getByRole('button', { name: steps[0].names }).or(page.locator('button[data-autom="add-to-cart"], button[data-autom="add-to-bag"]')));
-      if (buttons.length > 1) throw new Error('商品页存在多个购买按钮，请重新绑定');
-      if (buttons.length === 1 && await buttons[0].isEnabled()) return buttons[0];
+    report?.(`开售重试第 ${attempt} 次：${reason}`);
+    try {
+      await page.reload();
+      if (!isAppleConfigPage(page.url())) throw new Error('等待开售期间页面已离开商品配置页');
+      const state = await settleConfigurator(page, Math.min(settleMs, left()), expected);
+      if (state.cover) reason = '官网正在等待开售（预购等待页）；该页会自行轮询，稍后重试';
+      else if (!state.ready) reason = '页面尚未渲染出购买区';
+      else {
+        let mistakes = state.mistakes;
+        if (mistakes.length) {
+          // 校正后必须原地复查：重新加载会把页面默认值恢复回来，看不出结果。
+          const applied = await applyExpectedSelection(page, expected);
+          report?.(`已校正默认配置：${applied.join('、') || mistakes.join('、')}`);
+          await wait(Math.min(400, left()));
+          mistakes = (await settleConfigurator(page, Math.min(settleMs, left()), expected)).mistakes;
+        }
+        if (mistakes.length) reason = `默认配置未校正：${mistakes.join('、')}`;
+        else {
+          // 购买区渲染完不等于控件已经换好：页面还要等 updateSummary 返回。
+          const dwellUntil = Date.now() + Math.min(dwellMs, left());
+          let control = await resolveBuyControl(page);
+          while (!control && Date.now() < dwellUntil) {
+            await wait(Math.min(300, Math.max(0, dwellUntil - Date.now())));
+            control = await resolveBuyControl(page);
+          }
+          if (control) return control;
+          reason = '购买按钮尚未启用';
+        }
+      }
+    } catch (error) {
+      if (run.cancelled) throw new Error('已停止等待开售');
+      if (page.isClosed?.()) throw error;
+      // 权限、标签页和窗口问题不会靠重试解决，立即交给人工。
+      if (/窗口已关闭|窗口只有一个标签页|自动化权限|来自 Apple 事件|最终订单|离开商品配置页/.test(error.message)) throw error;
+      reason = error.message;
     }
-    await wait(pollMs);
+    await wait(Math.min(retryDelayMs, left()));
   }
-  throw new Error('等待开售按钮启用超时，请检查官网');
+  throw new Error(`开售重试超时（${Math.round(timeoutMs / 1000)} 秒）：${reason}。请手动刷新官网核查`);
+}
+
+function isAppleConfigPage(url) {
+  return isAppleReleaseURL(url) && !/[?&]step=attach/.test(url);
+}
+
+// 等购买区渲染出来再判断，否则会把「还没渲染」误判成「还没开售」而白白重试。
+async function settleConfigurator(page, budgetMs, expected) {
+  const deadline = Date.now() + budgetMs;
+  for (;;) {
+    const state = await page.evaluate(expected => {
+      const text = document.body?.innerText || '';
+      const cover = window?.data?.cv === 'preorder' || /来得早，来得好|即将与你见面/.test(text);
+      const buyArea = document.querySelector('.rc-summary-button, [data-autom="continueButton"], [data-autom="add-to-cart"], [data-autom="add-to-bag"]');
+      const radio = (name, value) => document.querySelector(`input[name="${name}"][value="${value}"]`);
+      const mistakes = [];
+      if (!radio('dimensionColor', expected.color)?.checked && radio('dimensionColor', expected.color)) mistakes.push('颜色');
+      if (!radio('dimensionCapacity', expected.capacity)?.checked && radio('dimensionCapacity', expected.capacity)) mistakes.push('容量');
+      if (!radio('tradeupinline', 'noTradeIn')?.checked && radio('tradeupinline', 'noTradeIn')) mistakes.push('不折抵换购');
+      // 只有加了 AppleCare+ 才算偏离默认，未选中任何一项等价于不加。
+      if (document.querySelector('input[data-autom="acp"]')?.checked) mistakes.push('不加 AppleCare+');
+      return { ready: Boolean(buyArea), cover, mistakes };
+    }, expected);
+    if (state.ready || state.cover || Date.now() >= deadline) return state;
+    await wait(150);
+  }
+}
+
+// 苹果的 AppleCare 两个选项 name 和 value 完全相同，只能靠 data-autom 区分。
+async function applyExpectedSelection(page, expected) {
+  return page.evaluate(expected => {
+    const applied = [];
+    const choose = (element, label) => { if (element && !element.checked) { element.click(); applied.push(label); } };
+    const radio = (name, value) => document.querySelector(`input[name="${name}"][value="${value}"]`);
+    choose(radio('dimensionColor', expected.color), '颜色');
+    choose(radio('dimensionCapacity', expected.capacity), '容量');
+    choose(radio('tradeupinline', 'noTradeIn'), '不折抵换购');
+    if (document.querySelector('input[data-autom="acp"]')?.checked) choose(document.querySelector('input[data-autom="noapplecare"]'), '不加 AppleCare+');
+    return applied;
+  }, expected);
+}
+
+async function resolveBuyControl(page) {
+  const buttons = await visible(page.getByRole('button', { name: steps[0].names }).or(page.locator(buyControlSelector)));
+  // 配件推荐位会复用同一个 data-autom，多个候选时交给人工避免多加商品。
+  if (buttons.length > 1) throw new Error('商品页存在多个购买按钮，请重新绑定');
+  if (!buttons.length) return undefined;
+  const enabled = await buttons[0].isEnabled().catch(error => {
+    if (/not attached to the DOM/.test(error.message)) return false;
+    throw error;
+  });
+  return enabled ? buttons[0] : undefined;
 }

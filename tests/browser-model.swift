@@ -20,6 +20,12 @@ struct BrowserModelTests {
             assert(PurchaseBrowser.defaultBrowser(for: url) == .chrome)
         }
         assert(PurchaseTask(name: "Apple 演练", url: "https://example.com", demo: true, appleFlow: true).selectedBrowser == .chrome)
+        let duoTask = PurchaseTask(name: "Apple · Duo", url: "https://www.apple.com.cn/shop/buy-iphone/iphone-duo/mk2p4ch/a", appleFlow: true)
+        assert(duoTask.isAppleRelease, "苹果商品配置页无需绑定按钮")
+        for url in ["https://www.apple.com.cn/shop/bag", "https://www.apple.com/shop/checkout", "https://example.com/shop/buy-iphone/x", "https://apple.com.cn.attacker.test/shop/buy-iphone/x", "https://www.apple.com.cn/shop/buy-iphone"] {
+            assert(!PurchaseTask(name: "其他", url: url, appleFlow: true).isAppleRelease, "只有苹果商品配置页免绑定：\(url)")
+        }
+        assert(!PurchaseTask(name: "非苹果任务", url: "https://www.apple.com.cn/shop/buy-iphone/iphone-duo/mk2p4ch/a").isAppleRelease, "未开启苹果流程的任务不免绑定")
         let share = "【淘宝】 https://m.tb.cn/h.example?tk=abc CZ001 「Apple 商品」 点击链接直接打开"
         assert(PurchaseLink.extract(from: share) == "https://m.tb.cn/h.example?tk=abc")
         for url in ["https://detail.tmall.com/item.htm?id=123", "https://m.tb.cn/h.example", "https://e.tb.cn/h.example", "https://item.taobao.com/item.htm?id=123", "https://www.taobao.cn/example"] {
@@ -65,6 +71,13 @@ struct BrowserModelTests {
         assert(local.count == 1 && local[0].id == savedTmall.id, "已有列表优先于预置页面")
         assert(local[0].submitOrder == true, "已开启天猫结账的任务应自动继续到立即支付")
         assert(local[0].isTmallCart, "预置购物车任务应识别为淘宝购物车")
+        let legacyTmallJSON = Data(#"{"id":"legacy-tmall","name":"天猫购物车","url":"https://cart.taobao.com/cart.htm","enabled":true,"demo":false,"tmall":true,"browser":"chrome","state":"idle","message":"尚未打开"}"#.utf8)
+        var legacyTmall = try JSONDecoder().decode(PurchaseTask.self, from: legacyTmallJSON)
+        assert(legacyTmall.tmallFlow != true, "旧任务保存时还没有天猫结账开关值")
+        preferences.set(try JSONEncoder().encode([legacyTmall]), forKey: "tasks")
+        legacyTmall = PurchaseTaskStore.load(preferences: preferences, defaultsURL: defaultsURL)[0]
+        assert(legacyTmall.tmallFlow == true && legacyTmall.submitOrder == true, "旧天猫任务应自动启用固定结账流程")
+        assert(legacyTmall.usesTmallFlow && legacyTmall.isTmallCart, "迁移后应识别为淘宝购物车任务")
         preferences.set(Data("[]".utf8), forKey: "tasks")
         assert(PurchaseTaskStore.load(preferences: preferences, defaultsURL: defaultsURL).isEmpty, "主动删除全部页面后不应恢复默认列表")
         print("PASS: browser defaults, legacy migration, explicit selection persistence and domain boundaries")

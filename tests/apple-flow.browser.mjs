@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { continueAppleCheckout, initialAppleProgress, isAppleURL, waitForAppleRelease } from '../engine/apple-flow.mjs';
+import { continueAppleCheckout, initialAppleProgress, isAppleURL, prepareAppleRelease } from '../engine/apple-flow.mjs';
 process.env.PLAYWRIGHT_BROWSERS_PATH ??= 'engine/browsers';
 const { chromium } = await import('playwright');
 const browser = await chromium.launch({ headless: true, channel: 'chromium' });
@@ -97,17 +97,47 @@ try {
     await page.goto('https://example.com/shop/checkout');
     assert.match((await run(page)).message, /离开苹果/);
   });
-  await fixture(`<button id="next" disabled value="add-to-cart">继续</button><script>
+  // 开售前页面上只有写死禁用的「继续」，而且页面自己不会再拉取可售状态，
+  // 所以必须靠刷新重试；刷新后才换成服务器下发的加购按钮。
+  await fixture(`<p id="root"></p><script>
     window.clicks=[];
-    setTimeout(()=>{next.outerHTML='<button id="next" value="add-to-cart">添加到购物袋</button>'; next.onclick=()=>{clicks.push('addBag'); history.replaceState({},'', '/shop/buy-iphone/iphone-18-pro?product=mjyd4ch/a&step=attach#'); setTimeout(()=>{document.body.innerHTML='<button id="bag" value="reviewBag">查看购物袋</button><button data-autom="add-to-cart">添加到购物袋 推荐配件</button>';bag.onclick=()=>{clicks.push('bag');document.body.innerHTML='<button>提交订单</button>';};},80);};},80);
+    const onProduct=location.pathname.startsWith('/shop/buy-iphone/');
+    const loads=Number(sessionStorage.getItem('radarLoads')||0)+1;
+    if(onProduct) sessionStorage.setItem('radarLoads',String(loads));
+    document.getElementById('root').innerHTML='<button disabled data-autom="continueButton">继续</button>';
+    if(onProduct&&loads>1){
+      document.getElementById('root').innerHTML='<form><button id="buy" data-autom="add-to-cart">添加到购物袋</button></form>';
+      document.getElementById('buy').onclick=()=>{
+        clicks.push('addBag');
+        history.replaceState({},'','/shop/buy-iphone/iphone-18-pro?product=mjyd4ch/a&step=attach#');
+        document.getElementById('root').innerHTML='<button id="bag" value="reviewBag">查看购物袋</button><button data-autom="add-to-cart">添加到购物袋 推荐配件</button>';
+        document.getElementById('bag').onclick=()=>{clicks.push('bag');document.getElementById('root').innerHTML='<button>提交订单</button>';};
+      };
+    }
     </script>`, async page => {
     await page.goto('https://www.apple.com.cn/shop/buy-iphone/iphone-18-pro/mjyd4ch/a');
-    const control = await waitForAppleRelease(page, await page.$('#next'), {cancelled:false}, {timeoutMs:500,pollMs:10});
+    assert.equal(await page.locator('#root button').innerText(),'继续','开售前只有写死的占位控件');
+    const control = await prepareAppleRelease(page,{cancelled:false},{timeoutMs:5000,settleMs:600,dwellMs:300,retryDelayMs:50});
+    assert.equal(await page.evaluate(()=>sessionStorage.getItem('radarLoads')),'2','刷新一次即可拿到开售按钮，不重复刷新');
     const progress = await initialAppleProgress(control,page.url());
     await control.click();
     const result = await continueAppleCheckout(page,{cancelled:false},()=>{}, {progress,timeoutMs:700,pollMs:10});
     assert.equal(result.state,'reviewOrder',result.message);
     assert.deepEqual(await page.evaluate(()=>clicks),['addBag','bag']);
+  });
+  await fixture(`<p id="root"></p><button disabled data-autom="continueButton">继续</button>`, async page => {
+    await page.goto('https://www.apple.com.cn/shop/buy-iphone/iphone-duo/mk2p4ch/a');
+    await assert.rejects(prepareAppleRelease(page,{cancelled:false},{timeoutMs:700,settleMs:300,dwellMs:200,retryDelayMs:50}),/开售重试超时/);
+  });
+  // 刷新后仍被改动过的折抵换购和 AppleCare 必须校正回默认，否则会加价下单。
+  await fixture(`<p id="root"></p><input type="radio" name="tradeupinline" value="tradeIn" checked><input type="radio" name="tradeupinline" value="noTradeIn"><input type="radio" name="applecare-options" value="on" data-autom="acp" checked><input type="radio" name="applecare-options" value="on" data-autom="noapplecare"><form><button data-autom="add-to-cart">添加到购物袋</button></form>`, async page => {
+    await page.goto('https://www.apple.com.cn/shop/buy-iphone/iphone-duo/mk2p4ch/a');
+    assert.ok(await prepareAppleRelease(page,{cancelled:false},{timeoutMs:3000,settleMs:600,dwellMs:300,retryDelayMs:50}),'校正默认配置后应解析到购买按钮');
+    assert.deepEqual(await page.evaluate(()=>({
+      noTradeIn:document.querySelector('input[name="tradeupinline"][value="noTradeIn"]').checked,
+      tradeIn:document.querySelector('input[name="tradeupinline"][value="tradeIn"]').checked,
+      appleCare:document.querySelector('input[data-autom="acp"]').checked
+    })),{noTradeIn:true,tradeIn:false,appleCare:false});
   });
   await fixture(`<form><label><input type="radio" name="payment">支付宝</label><label><input type="radio" name="payment">微信支付</label><button id="review" type="button">检查订单</button></form><script>
     window.clicks=[];
