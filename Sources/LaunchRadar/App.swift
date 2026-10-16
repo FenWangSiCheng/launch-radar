@@ -90,7 +90,7 @@ struct Dashboard: View {
                         .accessibilityLabel("倒计时 \(clockText(at: context.date))")
                 }
                 if model.hasScheduledTime {
-                    Text(model.target, format: .dateTime.month().day().hour().minute().second())
+                    Text(model.target, format: .dateTime.month().day().hour().minute())
                         .font(.caption).foregroundStyle(.secondary)
                 }
                 Text(model.phase).font(.caption).foregroundStyle(.secondary).lineLimit(2)
@@ -99,7 +99,8 @@ struct Dashboard: View {
             VStack(alignment: .trailing, spacing: 16) {
                 HStack(spacing: 12) {
                     Button("设置时间", systemImage: "clock") {
-                        scheduledTime = max(model.target, Date().addingTimeInterval(120))
+                        let nextTime = max(model.target, Date().addingTimeInterval(120))
+                        scheduledTime = Date(timeIntervalSince1970: ceil(nextTime.timeIntervalSince1970 / 60) * 60)
                         settingTime = true
                     }.disabled(!model.canArm)
                     Button("立即运行", systemImage: "play.fill") { model.runNow() }
@@ -131,10 +132,6 @@ struct Dashboard: View {
             Text("保存后开始等待，到点自动运行所有参与任务。")
                 .foregroundStyle(.secondary)
             DatePicker("运行时间", selection: $scheduledTime, displayedComponents: [.date, .hourAndMinute])
-            Stepper("秒：\(Calendar.current.component(.second, from: scheduledTime))", value: Binding(
-                get: { Calendar.current.component(.second, from: scheduledTime) },
-                set: { scheduledTime = scheduledTime.addingTimeInterval(Double($0 - Calendar.current.component(.second, from: scheduledTime))) }
-            ), in: 0...59)
             HStack {
                 Spacer()
                 Button("取消") { settingTime = false }.keyboardShortcut(.cancelAction)
@@ -213,23 +210,16 @@ struct TaskRow: View {
                 if task.douyinHandoff == true {
                     Text("手机接力 · 到点提醒 · 下单和订单在抖音 App 中处理").font(.caption).foregroundStyle(.secondary)
                 } else {
-                if task.tmall == true || task.jd == true {
-                    Text(task.jd == true ? "京东 · 提前核对有货商品、规格、金额、默认地址和付款方式" : "天猫 · 提前勾选有货商品、核对规格和金额；付款由你本人完成")
+                if task.jd == true {
+                    Text(task.isJDCart ? "京东购物车 · 到点刷新并全选，然后去结算 → 立即支付；付款由你完成" : "京东 · 去结算 → 立即支付；付款由你完成")
                         .font(.caption).foregroundStyle(.secondary)
-                    Toggle(task.jd == true ? "自动继续京东结账（Safari / Chrome）" : "自动继续天猫结账（Chrome）", isOn: Binding(
-                        get: { task.jd == true ? (task.jdFlow ?? false) : (task.tmallFlow ?? false) },
-                        set: { if task.jd == true { task.jdFlow = $0 } else { task.tmallFlow = $0 }; model.persist() }
+                } else if task.tmall == true {
+                    Text(task.isTmallCart ? "淘宝购物车 · 到点刷新并尝试全选，然后去结算 → 立即支付；付款由你完成" : "天猫 · 去结算 → 立即支付；付款由你完成")
+                        .font(.caption).foregroundStyle(.secondary)
+                    Toggle("自动继续天猫结账（Chrome）", isOn: Binding(
+                        get: { task.tmallFlow ?? false },
+                        set: { task.tmallFlow = $0; model.persist() }
                     )).toggleStyle(.checkbox).font(.caption).disabled(busy)
-                    if task.tmallFlow == true || task.jdFlow == true {
-                        Toggle("自动创建订单（点击立即支付，付款由本人完成）", isOn: Binding(
-                            get: { task.submitOrder ?? false },
-                            set: { task.submitOrder = $0; model.persist() }
-                        )).toggleStyle(.checkbox).font(.caption).disabled(busy)
-                    }
-                    if task.jd == true {
-                        Text("勾选后会按已选地址和付款方式点击「立即支付」创建订单；出现弹框时关闭并最多额外重试 50 次，进入付款页后由你本人付款。")
-                            .font(.caption).foregroundStyle(.secondary)
-                    }
                 }
                 Picker("浏览器", selection: Binding(
                     get: { task.selectedBrowser },
@@ -257,14 +247,16 @@ struct TaskRow: View {
             HStack(spacing: 8) {
                 if (task.appleFlow == true || task.tmallFlow == true || task.jdFlow == true) && ["handoff", "uncertain", "reviewOrder"].contains(task.state) {
                     Button("继续结账") { model.resume(task) }.disabled(busy || !model.connected)
-                        .help(task.jd == true || task.tmall == true ? "处理页面提示后核查并继续；保留重试次数，下单弹框最多额外重试 50 次" : "处理页面提示后核查并继续；保留重试次数，下单弹框最多额外重试 10 次")
+                        .help(task.jd == true || task.tmall == true ? "处理页面提示后核查并继续；去结算和立即支付异常分别最多重试 1 分钟，继续不会重新计时" : "处理页面提示后核查并继续；下单弹框最多额外重试 10 次")
                 }
                 if task.douyinHandoff == true {
                     Button("手机购买", systemImage: "qrcode") { showingMobile = true }
                 } else {
                 Button("打开") { model.open(task) }.disabled(busy || !model.connected)
-                Button("选按钮") { model.send(["type": "pick", "id": task.id]) }
-                    .disabled(busy || ["idle", "closed", "opening"].contains(task.state) || !model.connected)
+                if !task.isTmallCart && !task.isJDCart {
+                    Button("选按钮") { model.send(["type": "pick", "id": task.id]) }
+                        .disabled(busy || ["idle", "closed", "opening"].contains(task.state) || !model.connected)
+                }
                 Button { model.send(["type": "focus", "id": task.id]) } label: { Image(systemName: "arrow.up.forward.app") }
                     .help("查看浏览器页面").accessibilityLabel("查看 \(task.name)").disabled(task.state == "idle")
                 }
@@ -310,7 +302,7 @@ struct AddTaskSheet: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 24) {
             Text("添加购买页面").font(.title2.weight(.semibold))
-            Text(douyin ? "保存商品分享链接，电脑到点提醒，手机抖音 App 完成购买。" : jd ? "打开京东购物车，准备好规格和地址，绑定购物车「全选」，到点全选后自动结算。" : tmall ? "粘贴天猫商品分享链接，准备好规格和地址，绑定购物车「全选」，到点全选后自动结算。" : "人工准备信息后，工具按统一时间点击你选定的按钮。")
+            Text(douyin ? "保存商品分享链接，电脑到点提醒，手机抖音 App 完成购买。" : jd ? "京东购物车无需绑定按钮：到点刷新、尝试全选并结算。" : tmall ? "使用淘宝购物车可免绑定按钮：到点刷新、尝试全选并结算，随后点击「立即支付」。" : "人工准备信息后，工具按统一时间点击你选定的按钮。")
                 .foregroundStyle(.secondary)
             Form {
                 Picker("购买方式", selection: $entry) {
@@ -338,7 +330,7 @@ struct AddTaskSheet: View {
 
                 }
             }.textFieldStyle(.roundedBorder)
-            Text(douyin ? "请在抖音 App 核对店名为 Apple Store 官方旗舰店，提前选好规格和地址。此任务无需绑定网页按钮；购物车、订单和付款在手机中处理。" : jd ? "登录后把购物车整理为本次要购买的商品，核对规格和合计金额，再绑定「全选」。默认停在结算页。开启自动创建订单后，会点击结算页的「立即支付」，保留已选地址和付款方式；出现弹框时关闭并最多额外重试 50 次，进入付款页后由你本人付款。结果不明时暂停，请本人核查订单。登录或验证码时暂停；不检查商品金额。商品详情页使用单次点击时，请关闭自动继续结账。" : tmall ? "可直接使用淘宝购物车。登录后把购物车整理为本次要购买的商品，核对型号、颜色、容量和金额，再绑定「全选」。开启自动创建订单后，会在确认订单页点击「立即支付」创建订单；出现弹框时关闭并最多额外重试 50 次，在付款页响铃提醒你本人支付。默认停在确认订单页；缺货、金额为 0、登录或验证码需要手动处理。商品详情页使用单次点击时，请关闭自动继续结账。" : "苹果官网默认使用 Safari，其他网站默认使用 Chrome。Safari 首次使用需允许自动化和来自 Apple 事件的 JavaScript。")
+            Text(douyin ? "请在抖音 App 核对店名为 Apple Store 官方旗舰店，提前选好规格和地址。此任务无需绑定网页按钮；购物车、订单和付款在手机中处理。" : jd ? "京东购物车任务无需绑定按钮。到点刷新、全选，点击「去结算」，再点击「立即支付」；后续付款由你本人完成。登录、验证码、购物车加载失败或操作频繁时会停止。" : tmall ? "淘宝购物车任务无需绑定按钮。到点刷新、全选，点击「结算」，再点击结算页显示金额的「立即支付」；金额随商品变化，后续付款由你本人完成。登录、验证码、缺货、必填信息缺失或操作频繁时会停止。" : "苹果官网默认使用 Safari，其他网站默认 Chrome。Safari 首次使用需允许来自 Apple 事件的 JavaScript。")
                 .font(.caption).foregroundStyle(.secondary)
             HStack {
                 Spacer()

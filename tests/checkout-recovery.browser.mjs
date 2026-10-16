@@ -77,18 +77,21 @@ try {
     // Route transition must change host via navigation, not cross-origin history.
     await page.evaluate(url => { next.onclick = () => { clicks++; location.href = url; }; }, confirm);
     await page.unroute('**/*');
-    await page.route('**/*', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: '<p>实付款 ¥12999</p><button>提交订单</button>' }));
+    await page.route('**/*', route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: '<p>实付款 ¥12999</p><button id="next">提交订单</button><script>window.pays=0;next.onclick=()=>{window.pays++;document.body.innerHTML=\'<h1>收银台</h1>\';};</script>' }));
     const progress = { pending: 'cart', submitted: false };
-    assert.equal((await followTmall(page, { progress, timeoutMs: 600 })).state, 'reviewOrder');
-    assert.equal(progress.retries.cart, 1);
+    assert.equal((await followTmall(page, { progress, timeoutMs: 600, checkoutRetryWindowMs: 4000 })).state, 'paymentReady');
+    assert.ok(progress.retryDeadlines.cart > Date.now());
+    assert.equal(progress.retries.cart, undefined);
+    assert.equal(await page.evaluate(() => window.pays), 1);
   });
-  await fixture(confirm, `<p>实付款 ¥12999</p><button id="next">提交订单</button><script>window.clicks=0;next.onclick=()=>{clicks++;document.body.insertAdjacentHTML('beforeend',${JSON.stringify(failure)});};</script>`, async page => {
+  // The post-submit dialog budget is a time window; a fixed retry count is gone.
+  await fixture(confirm, '<p>实付款 ¥12999</p><button id="next">提交订单</button><script>window.clicks=0;next.onclick=()=>{clicks++;document.body.insertAdjacentHTML("beforeend",\'<div role="dialog">订单失败，请重试<button onclick="this.parentElement.remove()">确定</button></div>\');};</script>', async page => {
     const progress = {};
-    assert.equal((await followTmall(page, { progress, submitOrder: true })).state, 'uncertain');
-    assert.match((await followTmall(page, { progress, submitOrder: true })).message, /50 次订单重试上限/);
-    await page.locator('[role="dialog"] button').click();
-    await followTmall(page, { progress, submitOrder: true });
-    assert.equal(await page.evaluate(() => clicks), 51);
+    const options = { progress, submissionRetryWindowMs: 250 };
+    assert.equal((await followTmall(page, options)).state, 'uncertain');
+    assert.match((await followTmall(page, options)).message, /重试 1 分钟/);
+    assert.ok(await page.evaluate(() => clicks) > 1);
+    assert.equal(progress.submissionRetries, undefined);
   });
   await fixture(confirm, '<p>实付款 ¥12999</p><button id="next">提交订单</button><script>window.clicks=0;next.onclick=()=>clicks++;</script>', async page => {
     const progress = {};
@@ -118,42 +121,66 @@ try {
     assert.equal(await page.locator('[role="dialog"]').count(), 0);
   });
   // Any modal message triggers final-order retry, including unfamiliar text.
-  for (const platform of ['apple', 'tmall']) {
-    const url = platform === 'apple' ? apple : confirm;
-    const follow = platform === 'apple' ? followApple : followTmall;
-    const button = platform === 'apple' ? '立即下单' : '提交订单';
-    const prefix = platform === 'apple' ? '' : '<p>实付款 ¥12999</p>';
-    const unknown = '<div role="dialog">任意未知提示：订单已提交失败<button onclick="this.parentElement.remove()">关闭</button></div>';
-    await fixture(url, `${prefix}<button id="next">${button}</button><script>window.clicks=0;window.paid=0;next.onclick=()=>{clicks++;if(clicks<4)document.body.insertAdjacentHTML('beforeend',${JSON.stringify(unknown)});else document.body.innerHTML='<h1>等待买家付款</h1><button onclick="window.paid++">立即支付</button>';};</script>`, async page => {
-      const progress = { visited: new Set() };
-      assert.equal((await follow(page, { progress, submitOrder: true })).state, 'paymentReady');
-      assert.equal(await page.evaluate(() => clicks), 4);
-      assert.equal(progress.submissionRetries, 3);
-      await follow(page, { progress, submitOrder: true });
-      assert.equal(await page.evaluate(() => window.paid), 0);
-    });
-    await fixture(url, `${prefix}<button id="next">${button}</button><script>window.clicks=0;next.onclick=()=>{clicks++;document.body.insertAdjacentHTML('beforeend',${JSON.stringify(unknown)});};</script>`, async page => {
-      const progress = { visited: new Set() };
-      const limit = platform === 'apple' ? 10 : 50;
-      assert.ok((await follow(page, { progress, submitOrder: true })).message.includes(`${limit} 次订单重试上限`));
-      assert.equal(await page.evaluate(() => clicks), limit + 1);
-      assert.equal(progress.submissionRetries, limit);
-      await follow(page, { progress, submitOrder: true });
-      assert.equal(await page.evaluate(() => clicks), limit + 1);
-    });
-    await fixture(url, `${prefix}<button id="next">${button}</button><script>window.clicks=0;next.onclick=()=>{clicks++;document.body.insertAdjacentHTML('beforeend',${JSON.stringify(unknown)});};</script>`, async page => {
-      const run = { cancelled: false };
-      setTimeout(() => { run.cancelled = true; }, 70);
-      await follow(page, { progress: { visited: new Set() }, submitOrder: true, submissionRetryDelayMs: 1000 }, run);
-      assert.equal(await page.evaluate(() => clicks), 1);
-    });
-  }
+  const order = '<p>实付款 ¥12999</p>';
+  const unknown = '<div role="dialog">任意未知提示：订单已提交失败<button onclick="this.parentElement.remove()">关闭</button></div>';
+  // Deliberately free of “已提交”, so the dialog recovery is what handles it.
+  const busy = '<div role="dialog">系统繁忙<button onclick="this.parentElement.remove()">确定</button></div>';
+  await fixture(apple, `<button id="next">立即下单</button><script>window.clicks=0;window.paid=0;next.onclick=()=>{clicks++;if(clicks<4)document.body.insertAdjacentHTML('beforeend',${JSON.stringify(unknown)});else document.body.innerHTML='<h1>等待买家付款</h1><button onclick="window.paid++">立即支付</button>';};</script>`, async page => {
+    const progress = { visited: new Set() };
+    assert.equal((await followApple(page, { progress, submitOrder: true })).state, 'paymentReady');
+    assert.equal(await page.evaluate(() => clicks), 4);
+    assert.equal(progress.submissionRetries, 3);
+    await followApple(page, { progress, submitOrder: true });
+    assert.equal(await page.evaluate(() => window.paid), 0);
+  });
+  await fixture(apple, `<button id="next">立即下单</button><script>window.clicks=0;next.onclick=()=>{clicks++;document.body.insertAdjacentHTML('beforeend',${JSON.stringify(unknown)});};</script>`, async page => {
+    const progress = { visited: new Set() };
+    assert.ok((await followApple(page, { progress, submitOrder: true })).message.includes('10 次订单重试上限'));
+    assert.equal(await page.evaluate(() => clicks), 11);
+    assert.equal(progress.submissionRetries, 10);
+    await followApple(page, { progress, submitOrder: true });
+    assert.equal(await page.evaluate(() => clicks), 11);
+  });
+  await fixture(apple, `<button id="next">立即下单</button><script>window.clicks=0;next.onclick=()=>{clicks++;document.body.insertAdjacentHTML('beforeend',${JSON.stringify(unknown)});};</script>`, async page => {
+    const run = { cancelled: false };
+    setTimeout(() => { run.cancelled = true; }, 70);
+    await followApple(page, { progress: { visited: new Set() }, submitOrder: true, submissionRetryDelayMs: 1000 }, run);
+    assert.equal(await page.evaluate(() => clicks), 1);
+  });
+  // Tmall retries the same order dialogs inside a one-minute window instead of
+  // a fixed count, matching the JD flow.
+  await fixture(confirm, `${order}<button id="next">提交订单</button><script>window.clicks=0;next.onclick=()=>{clicks++;if(clicks<4)document.body.insertAdjacentHTML('beforeend',${JSON.stringify(busy)});else document.body.innerHTML='<h1>等待买家付款</h1><button onclick="window.paid=(window.paid||0)+1">立即支付</button>';};</script>`, async page => {
+    const progress = {};
+    assert.equal((await followTmall(page, { progress, submissionRetryWindowMs: 3000 })).state, 'paymentReady');
+    assert.equal(await page.evaluate(() => clicks), 4);
+    assert.equal(progress.submissionRetries, undefined);
+    assert.ok(progress.submissionRetryDeadlineAt > Date.now());
+    await followTmall(page, { progress });
+    assert.equal(await page.evaluate(() => window.paid), undefined);
+  });
+  await fixture(confirm, `${order}<button id="next">提交订单</button><script>window.clicks=0;next.onclick=()=>{clicks++;document.body.insertAdjacentHTML('beforeend',${JSON.stringify(busy)});};</script>`, async page => {
+    const progress = {};
+    const options = { progress, submissionRetryWindowMs: 250 };
+    assert.match((await followTmall(page, options)).message, /重试 1 分钟/);
+    const clicks = await page.evaluate(() => clicks);
+    assert.ok(clicks > 1);
+    assert.equal(progress.submissionRetries, undefined);
+    if (await page.locator('[role="dialog"]').count()) await page.locator('[role="dialog"] button').first().click();
+    assert.match((await followTmall(page, options)).message, /重试 1 分钟/);
+    assert.equal(await page.evaluate(() => clicks), clicks);
+  });
+  await fixture(confirm, `${order}<button id="next">提交订单</button><script>window.clicks=0;next.onclick=()=>{clicks++;document.body.insertAdjacentHTML('beforeend',${JSON.stringify(busy)});};</script>`, async page => {
+    const run = { cancelled: false };
+    setTimeout(() => { run.cancelled = true; }, 70);
+    await followTmall(page, { progress: {}, submissionRetryDelayMs: 1000 }, run);
+    assert.equal(await page.evaluate(() => clicks), 1);
+  });
   await fixture(confirm, '<p>实付款 ¥12999</p><button id="next">提交订单</button><script>window.clicks=0;next.onclick=()=>{clicks++;if(clicks<3)alert("任意提示");else document.body.innerHTML="等待买家付款";};</script>', async page => {
     const progress = {};
     page.on('dialog', async dialog => { await dialog.dismiss(); page.radarSubmissionDialog = true; });
-    assert.equal((await followTmall(page, { progress, submitOrder: true })).state, 'paymentReady');
+    assert.equal((await followTmall(page, { progress })).state, 'paymentReady');
     assert.equal(await page.evaluate(() => clicks), 3);
-    assert.equal(progress.submissionRetries, 2);
+    assert.ok(progress.submissionRetryDeadlineAt > Date.now());
   });
   console.log(JSON.stringify({ result: 'PASS', recoveryChecks: checks, environment: 'mocked congestion; no real orders' }));
 } finally { await browser.close(); }

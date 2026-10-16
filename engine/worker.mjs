@@ -8,8 +8,8 @@ import { SafariPage, browserChoice, pickScript } from './safari.mjs';
 import { fileURLToPath } from 'node:url';
 import { Scheduler } from './scheduler.mjs';
 import { continueAppleCheckout, initialAppleProgress, isAppleURL, waitForAppleRelease } from './apple-flow.mjs';
-import { checkTmallAction, prepareTmallAction, continueTmallCheckout, resolveTmallButton } from './tmall-flow.mjs';
-import { checkJDAction, prepareJDAction, continueJDCheckout, resolveJDButton } from './jd-flow.mjs';
+import { checkTmallAction, prepareTmallAction, prepareTmallCartAtRelease, continueTmallCheckout, resolveTmallButton, isTmallCartURL } from './tmall-flow.mjs';
+import { checkJDAction, prepareJDAction, prepareJDCartAtRelease, continueJDCheckout, resolveJDButton, isJDCartURL } from './jd-flow.mjs';
 import { observeJDCartRequests } from './jd-diagnostics.mjs';
 
 import { isCheckoutErrorText } from './checkout-recovery.mjs';
@@ -133,7 +133,7 @@ async function openTask(command) {
   const previous = tasks.get(command.id);
   stopPicker(previous);
   if (previous) await previous.page?.close().catch(() => {});
-  const task = { id: command.id, clicked: false, demo: Boolean(command.demo), appleFlow: Boolean(command.appleFlow), tmallFlow: command.tmallFlow === true, jdFlow: command.jdFlow === true, submitOrder: Boolean(command.submitOrder), browser: choice, douyinHandoff: command.douyinHandoff === true };
+  const task = { id: command.id, clicked: false, demo: Boolean(command.demo), appleFlow: Boolean(command.appleFlow), tmallFlow: command.tmallFlow === true, jdFlow: command.jdFlow === true, submitOrder: command.tmallFlow === true || command.jdFlow === true || Boolean(command.submitOrder), browser: choice, douyinHandoff: command.douyinHandoff === true };
   let page;
   if (choice === 'safari') {
     const target = task.demo ? await safariDemoURL(task.appleFlow ? appleDemoHTML() : demoHTML(command.name || '演练平台')) : url.href;
@@ -141,7 +141,9 @@ async function openTask(command) {
     page.appleDemoURL = task.demo && task.appleFlow ? target : undefined;
     task.page = page;
     tasks.set(task.id, task);
-    status(task.id, 'opened', 'Safari 已打开；请人工准备信息，再点击「选按钮」');
+    status(task.id, 'opened', task.jdFlow && isJDCartURL(page.url())
+      ? '京东购物车已打开；到点将刷新、全选并结算，无需绑定按钮'
+      : 'Safari 已打开；请人工准备信息，再点击「选按钮」');
     return;
   }
   const session = await browser();
@@ -183,7 +185,8 @@ async function openTask(command) {
   page.on('framenavigated', frame => {
     if (frame === page.mainFrame() && task.button && !task.clicked) {
       task.button = undefined;
-      status(task.id, 'stale', '页面已跳转，请重新绑定按钮');
+      const cart = task.tmallFlow && isTmallCartURL(frame.url()) || task.jdFlow && isJDCartURL(frame.url());
+      status(task.id, cart ? 'opened' : 'stale', cart ? '购物车已刷新；无需绑定按钮' : '页面已跳转，请重新绑定按钮');
     }
   });
   if (task.demo && task.appleFlow) {
@@ -193,7 +196,9 @@ async function openTask(command) {
   else if (task.demo) await page.setContent(demoHTML(command.name || '演练平台'));
   else await page.goto(url.href, { waitUntil: 'domcontentloaded', timeout: 45000 });
   await page.bringToFront();
-  status(task.id, 'opened', '请人工准备信息，再点击「选按钮」');
+  status(task.id, 'opened', (task.tmallFlow && isTmallCartURL(page.url()) || task.jdFlow && isJDCartURL(page.url()))
+    ? '请核对购物车商品和规格；到点将刷新、全选并结算，无需绑定按钮'
+    : '请人工准备信息，再点击「选按钮」');
 }
 
 async function pickButton(id) {
@@ -276,25 +281,31 @@ async function pickButton(id) {
 async function checkTask(task) {
   if (task?.douyinHandoff) { status(task.id, "ready", "手机购买提醒已就绪；到点后在抖音 App 下单"); return; }
   if (task?.page.refreshURL) await task.page.refreshURL();
-  if (!task || task.page.isClosed() || !task.button) throw new Error('存在未绑定或已关闭的任务');
+  if (!task || task.page.isClosed()) throw new Error('存在未打开或已关闭的任务');
+  const tmallCart = task.tmallFlow && isTmallCartURL(task.page.url());
+  const jdCart = task.jdFlow && isJDCartURL(task.page.url());
+  if (!task.button && !tmallCart && !jdCart) throw new Error('存在未绑定的任务');
   if (task.clicked) throw new Error('该任务已经点击过，请人工核查订单并重新绑定');
-  if (task.page.url() !== task.boundURL) throw new Error('页面已经变化，请重新绑定按钮');
+  if (task.button && task.page.url() !== task.boundURL) throw new Error('页面已经变化，请重新绑定按钮');
   if (task.appleFlow && task.page.url() !== task.page.appleDemoURL && !isAppleURL(task.page.url())) throw new Error('后续步骤仅适用于苹果官网，请关闭该选项或打开苹果页面');
   if (task.tmallFlow) {
     if (task.appleFlow || task.jdFlow || task.browser !== 'chrome') throw new Error('天猫自动流程请使用 Chrome，并关闭其他平台结账');
-    await checkTmallAction(task.page, task.button, { submitOrder: task.submitOrder, binding: true });
+    if (!tmallCart) await checkTmallAction(task.page, task.button, { binding: true });
   }
   if (task.jdFlow) {
     if (task.appleFlow || task.tmallFlow) throw new Error('京东自动流程请关闭其他平台结账');
-    await checkJDAction(task.page, task.button, { submitOrder: task.submitOrder, binding: true });
+    if (!jdCart) await checkJDAction(task.page, task.button, { binding: true });
   }
   if (task.appleFlow) {
     await initialAppleProgress(task.button, task.page.url());
   }
-  const connected = await task.button.evaluate(element => element.isConnected);
-  if (!connected || !await task.button.isVisible()) {
-    throw new Error('目标按钮已失效或隐藏，请重新绑定');
+  if (tmallCart || jdCart) {
+    task.boundURL = task.page.url();
+    status(task.id, 'ready', `${jdCart ? '京东' : '淘宝'}购物车已就绪；到点刷新并尝试全选，最多 1 分钟`);
+    return;
   }
+  const connected = await task.button.evaluate(element => element.isConnected);
+  if (!connected || !await task.button.isVisible()) throw new Error('目标按钮已失效或隐藏，请重新绑定');
   // A trial click checks overlays and scrolls the target into view without submitting.
   const enabled = await task.button.isEnabled();
   if (enabled) await task.button.click({ trial: true, timeout: 2000 });
@@ -311,39 +322,55 @@ async function execute(task, run) {
     }
     if (task.page.refreshURL) await task.page.refreshURL();
     if (task.page.isClosed() || task.page.url() !== task.boundURL) throw new Error('页面已关闭或变化');
+    const tmallCart = task.tmallFlow && isTmallCartURL(task.page.url());
+    const jdCart = task.jdFlow && isJDCartURL(task.page.url());
     if (task.appleFlow && /\/shop\/buy-iphone\//.test(new URL(task.page.url()).pathname)) {
       status(task.id, 'following', '正在等待开售按钮启用（最多 120 秒）');
       task.button = await waitForAppleRelease(task.page, task.button, run);
     }
-    const valid = await task.button.evaluate(element => element.isConnected);
-    if (!valid) throw new Error('目标按钮已失效');
+    if (tmallCart || jdCart) {
+      // Reload replaces the bound DOM node. Resolve controls from the refreshed
+      // cart only after selection and checkout become available.
+      task.button = undefined;
+    } else {
+      const valid = await task.button.evaluate(element => element.isConnected);
+      if (!valid) throw new Error('目标按钮已失效');
+    }
     if (task.appleFlow) task.appleProgress = await initialAppleProgress(task.button, task.page.url());
-    if (task.tmallFlow) task.button = await prepareTmallAction(task.page, task.button, { submitOrder: task.submitOrder }, run);
+    let tmallKind = null;
+    if (task.tmallFlow) {
+      const prepared = tmallCart
+        ? await prepareTmallCartAtRelease(task.page, run, message => status(task.id, 'following', message))
+        : await prepareTmallAction(task.page, task.button, { returnKind: true }, run);
+      task.button = prepared.button;
+      tmallKind = prepared.kind;
+    }
     let jdKind = null;
     if (task.jdFlow) {
-      const prepared = await prepareJDAction(task.page, task.button, { submitOrder: task.submitOrder, returnKind: true }, run);
+      const prepared = jdCart
+        ? await prepareJDCartAtRelease(task.page, run, message => status(task.id, 'following', message))
+        : await prepareJDAction(task.page, task.button, { returnKind: true }, run);
       task.button = prepared.button;
       jdKind = prepared.kind;
     }
-    const tmallKind = task.tmallFlow ? await checkTmallAction(task.page, task.button, { submitOrder: task.submitOrder }) : null;
     if (run.cancelled) return;
     // Set before issuing the action: timeouts must never lead to automatic retries.
     task.clicked = true;
-    if (task.tmallFlow) task.tmallProgress = { submitted: tmallKind === 'confirm', pending: tmallKind === 'confirm' ? 'submit' : 'cart' };
+    if (task.tmallFlow) task.tmallProgress = { submitted: tmallKind === 'confirm', payClicked: tmallKind === 'confirm', pending: tmallKind === 'confirm' ? 'submit' : 'cart' };
     if (task.jdFlow) task.jdProgress = { submitted: jdKind !== 'cart', payClicked: jdKind === 'pay', pending: jdKind === 'cart' ? 'cart' : 'submit' };
     const issuedAt = Date.now();
     status(task.id, 'clicking', '正在点击', { issuedAt, delayMs: issuedAt - run.target });
     await task.button.click({ timeout: 1500, noWaitAfter: true });
     if (task.tmallFlow) {
-      status(task.id, 'following', '已触发，正在等待确认订单页；付款由你本人完成', { delayMs: issuedAt - run.target });
+      status(task.id, 'following', tmallKind === 'confirm' ? '已点击立即支付，正在等待付款页面；付款由你本人完成' : '已点击去结算，正在等待淘宝结算页并点击立即支付', { delayMs: issuedAt - run.target });
       const result = await continueTmallCheckout(task.page, run, message => status(task.id, 'following', message), {
-        submitOrder: task.submitOrder, progress: task.tmallProgress, getPage: () => task.checkoutPage || task.page
+        progress: task.tmallProgress, getPage: () => task.checkoutPage || task.page
       });
       await finishCheckout(task, result);
     } else if (task.jdFlow) {
-      status(task.id, 'following', '已触发，正在等待京东结算页，按自动提交选项继续', { delayMs: issuedAt - run.target });
+      status(task.id, 'following', '已点击去结算，正在等待京东结算页并点击立即支付', { delayMs: issuedAt - run.target });
       const result = await continueJDCheckout(task.page, run, message => status(task.id, 'following', message), {
-        submitOrder: task.submitOrder, progress: task.jdProgress, getPage: () => task.checkoutPage || task.page
+        progress: task.jdProgress, getPage: () => task.checkoutPage || task.page
       });
       await finishCheckout(task, result);
     } else if (task.appleFlow) {
@@ -402,7 +429,7 @@ async function handle(command) {
     case 'check': await checkTask(tasks.get(command.id)); break;
     case 'resume': {
       const task = tasks.get(command.id);
-      if (task && command.submitOrder !== undefined) task.submitOrder = command.submitOrder === true;
+      if (task && command.submitOrder !== undefined) task.submitOrder = task.tmallFlow || task.jdFlow || command.submitOrder === true;
       await scheduler.resume(task, async item => {
         if (item?.page.refreshURL) await item.page.refreshURL();
         if (!item?.clicked || (!item.appleFlow && !item.tmallFlow && !item.jdFlow) || item.page.isClosed()) throw new Error('请先执行苹果、天猫或京东任务，再处理页面提示');
@@ -412,9 +439,9 @@ async function handle(command) {
       }, async (item, run) => {
         const report = message => status(item.id, 'following', message);
         const result = item.tmallFlow
-          ? await continueTmallCheckout(item.checkoutPage || item.page, run, report, { progress: item.tmallProgress ??= { submitted: true }, submitOrder: item.submitOrder, getPage: () => item.checkoutPage || item.page })
+          ? await continueTmallCheckout(item.checkoutPage || item.page, run, report, { progress: item.tmallProgress ??= { submitted: true }, getPage: () => item.checkoutPage || item.page })
           : item.jdFlow
-            ? await continueJDCheckout(item.checkoutPage || item.page, run, report, { progress: item.jdProgress ??= { submitted: true }, submitOrder: item.submitOrder, getPage: () => item.checkoutPage || item.page })
+            ? await continueJDCheckout(item.checkoutPage || item.page, run, report, { progress: item.jdProgress ??= { submitted: true }, getPage: () => item.checkoutPage || item.page })
           : await continueAppleCheckout(item.page, run, report, { progress: item.appleProgress ??= { visited: new Set() }, submitOrder: item.submitOrder });
         await finishCheckout(item, result);
       });
@@ -448,7 +475,7 @@ async function handle(command) {
         if (task && command.appleFlows) task.appleFlow = command.appleFlows[task.id] === true;
         if (task && command.tmallFlows) task.tmallFlow = command.tmallFlows[task.id] === true;
         if (task && command.jdFlows) task.jdFlow = command.jdFlows[task.id] === true;
-        if (task && command.submitOrders) task.submitOrder = command.submitOrders[task.id] === true;
+        if (task && command.submitOrders) task.submitOrder = task.tmallFlow || task.jdFlow || command.submitOrders[task.id] === true;
       }
       if (command.type === 'runNow') await scheduler.runNow(selected, checkTask, execute);
       else await scheduler.arm(selected, command.target, checkTask, execute);

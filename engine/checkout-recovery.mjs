@@ -40,7 +40,7 @@ export async function inspectNotice(page, { checkoutErrors = false } = {}) {
   }, checkoutErrors);
 }
 
-export async function recoverNotice(page, notice, run, progress, key, report, { retryDelays = [1000, 2000, 4000], queueTimeoutMs = 180000 } = {}) {
+export async function recoverNotice(page, notice, run, progress, key, report, { retryDelays = [1000, 2000, 4000], retryWindowMs, queueTimeoutMs = 180000 } = {}) {
   progress.retries ??= {};
   if (notice.kind === 'queue') {
     progress.queueStarted ??= Date.now();
@@ -52,25 +52,31 @@ export async function recoverNotice(page, notice, run, progress, key, report, { 
   progress.queueReported = false;
   // Never repeat additions or order submissions based on a generic failure notice.
   if (notice.kind !== 'retryable' || !key || ['addBag', 'submit'].includes(key)) return { stop: `页面提示需要处理：${notice.text}` };
-  const attempts = progress.retries[key] || 0;
-  if (attempts >= retryDelays.length) return { stop: `已达到 ${retryDelays.length} 次重试上限：${notice.text}` };
   if (run.cancelled) return { stop: '已停止异常恢复' };
+  const timed = retryWindowMs !== undefined;
+  const attempts = progress.retries[key] || 0;
+  if (timed) {
+    progress.retryDeadlines ??= {};
+    progress.retryDeadlines[key] ??= Date.now() + retryWindowMs;
+    if (Date.now() >= progress.retryDeadlines[key]) return { stop: '去结算错误已重试 1 分钟，请核查购物车' };
+  } else if (attempts >= retryDelays.length) return { stop: `已达到 ${retryDelays.length} 次重试上限：${notice.text}` };
   const button = notice.native ? null : await page.$(`[data-radar-notice="${notice.token}"]`);
   if (!notice.native && !button) return { stop: '错误提示已变化，请手动核查' };
-  // Consume the allowance before dismissal, including ambiguous click results.
-  progress.retries[key] = attempts + 1;
+  // Keep the budget before dismissal, including ambiguous click results.
+  if (!timed) progress.retries[key] = attempts + 1;
   if (notice.native) page.radarCheckoutDialog = undefined;
   else await button.click({ timeout: 1500, noWaitAfter: true });
-  report(`平台明确提示操作失败，准备第 ${attempts + 1}/${retryDelays.length} 次重试：${notice.text}`);
-  const end = Date.now() + retryDelays[attempts];
+  report(timed ? `正在重试去结算（最多持续 1 分钟）：${notice.text}` : `平台明确提示操作失败，准备第 ${attempts + 1}/${retryDelays.length} 次重试：${notice.text}`);
+  const end = Date.now() + (timed ? 0 : retryDelays[attempts]);
   while (!run.cancelled && Date.now() < end) await wait(Math.min(100, end - Date.now()));
   if (run.cancelled) return { stop: '已停止异常恢复' };
+  if (timed && Date.now() >= progress.retryDeadlines[key]) return { stop: '去结算错误已重试 1 分钟，请核查购物车' };
   return { retry: true };
 }
 
 // Final-order recovery is explicitly authorized: dismiss a modal regardless of
 // its message, then allow one new submission. Keep the budget across resumes.
-export async function recoverSubmissionDialog(page, run, progress, report, { submissionRetryDelayMs = 0, submissionRetryLimit = 10 } = {}) {
+export async function recoverSubmissionDialog(page, run, progress, report, { submissionRetryDelayMs = 0, submissionRetryLimit = 10, submissionRetryWindowMs } = {}) {
   const native = page.radarSubmissionDialog;
   const modal = native ? { native: true } : await page.evaluate(() => {
     const shown = element => Boolean(element.getClientRects().length) && getComputedStyle(element).visibility !== 'hidden';
@@ -90,18 +96,26 @@ export async function recoverSubmissionDialog(page, run, progress, report, { sub
   if (!modal) return null;
   if (run.cancelled) return { stop: '已停止订单重试' };
   if (modal.blocked) return { stop: '无法确定弹框关闭按钮，请手动关闭后继续' };
-  const attempts = progress.submissionRetries || 0;
-  if (attempts >= submissionRetryLimit) return { stop: `已达到 ${submissionRetryLimit} 次订单重试上限，请核查订单` };
-  // Consume the attempt before dismissal, so failures cannot reset the budget.
-  progress.submissionRetries = attempts + 1;
+  const timed = submissionRetryWindowMs !== undefined;
+  if (timed) {
+    progress.submissionRetryDeadlineAt ??= Date.now() + submissionRetryWindowMs;
+    if (Date.now() >= progress.submissionRetryDeadlineAt) return { stop: '订单弹框已重试 1 分钟，请核查订单' };
+  } else {
+    const attempts = progress.submissionRetries || 0;
+    if (attempts >= submissionRetryLimit) return { stop: `已达到 ${submissionRetryLimit} 次订单重试上限，请核查订单` };
+    // Consume the attempt before dismissal, so failures cannot reset the budget.
+    progress.submissionRetries = attempts + 1;
+  }
   if (native) page.radarSubmissionDialog = undefined;
   else {
     const button = await page.$(`[data-radar-submit-dialog="${modal.token}"]`);
     if (!button) return { stop: '弹框已变化，请手动核查' };
     await button.click({ timeout: 1500, noWaitAfter: true });
   }
-  report(`已关闭下单弹框，准备第 ${attempts + 1}/${submissionRetryLimit} 次订单重试`);
+  report(timed ? '已关闭弹框，正在重试立即支付（最多持续 1 分钟）' : `已关闭下单弹框，准备第 ${progress.submissionRetries}/${submissionRetryLimit} 次订单重试`);
   const end = Date.now() + submissionRetryDelayMs;
   while (!run.cancelled && Date.now() < end) await wait(Math.min(100, end - Date.now()));
-  return run.cancelled ? { stop: '已停止订单重试' } : { retry: true };
+  if (run.cancelled) return { stop: '已停止订单重试' };
+  if (timed && Date.now() >= progress.submissionRetryDeadlineAt) return { stop: '订单弹框已重试 1 分钟，请核查订单' };
+  return { retry: true };
 }

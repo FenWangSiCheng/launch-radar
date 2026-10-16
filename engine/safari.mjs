@@ -19,6 +19,9 @@ const script = `on run argv
       return do JavaScript (item 3 of argv) in tab 1 of targetWindow
     else if item 1 of argv is "url" then
       return URL of tab 1 of targetWindow
+    else if item 1 of argv is "reload" then
+      do JavaScript "window.location.reload()" in tab 1 of targetWindow
+      return ""
     else if item 1 of argv is "focus" then
       set index of targetWindow to 1
       activate
@@ -62,6 +65,22 @@ export class SafariPage {
     try { this.currentURL = await this.transport('url', this.windowID); }
     catch (error) { if (error.message.includes('已关闭')) this.closed = true; throw error; }
     return this.currentURL;
+  }
+  async reload() {
+    const previous = await this.evaluate(() => performance.timeOrigin);
+    await this.transport('reload', this.windowID);
+    const deadline = Date.now() + 8000;
+    while (Date.now() < deadline) {
+      try {
+        await this.refreshURL();
+        const state = await this.evaluate(() => ({ origin: performance.timeOrigin, ready: document.readyState }));
+        if (state.origin !== previous && state.ready !== 'loading') return this.currentURL;
+      } catch (error) {
+        if (this.closed || /窗口只有一个标签页|自动化权限/.test(error.message)) throw error;
+      }
+      await wait(100);
+    }
+    throw new Error('Safari 刷新页面超时，请检查页面和网络');
   }
   async bringToFront() { await this.transport('focus', this.windowID); }
   async close() {

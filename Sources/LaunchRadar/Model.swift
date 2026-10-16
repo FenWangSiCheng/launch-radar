@@ -27,6 +27,14 @@ struct PurchaseTask: Identifiable, Codable {
     var submitOrder: Bool?
     var browser: PurchaseBrowser?
     var selectedBrowser: PurchaseBrowser { browser ?? (demo ? .chrome : PurchaseBrowser.defaultBrowser(for: url)) }
+    var isTmallCart: Bool {
+        guard tmallFlow == true, selectedBrowser == .chrome, let parsed = URL(string: url) else { return false }
+        return parsed.scheme == "https" && parsed.host == "cart.taobao.com" && parsed.path == "/cart.htm"
+    }
+    var isJDCart: Bool {
+        guard jdFlow == true, let parsed = URL(string: url), parsed.scheme == "https", parsed.host == "cart.jd.com" else { return false }
+        return ["/cart_index", "/cart_index/", "/cart.action", "/cart.html"].contains(parsed.path)
+    }
     var state = "idle"
     var message = "尚未打开"
     var delayMs: Double?
@@ -49,7 +57,10 @@ enum PurchaseTaskStore {
         guard let data, let saved = try? JSONDecoder().decode([PurchaseTask].self, from: data) else { return [] }
         return saved.map { task in
             var copy = task
-            copy.state = "idle"; copy.message = "请重新打开并绑定按钮"; copy.delayMs = nil
+            if copy.jd == true { copy.jdFlow = true; copy.submitOrder = true }
+            // The Tmall flow always continues to the confirmation page's “立即支付”.
+            if copy.tmall == true && copy.tmallFlow == true { copy.submitOrder = true }
+            copy.state = "idle"; copy.message = copy.isTmallCart || copy.isJDCart ? "请重新打开购物车" : "请重新打开并绑定按钮"; copy.delayMs = nil
             return copy
         }
     }
@@ -73,7 +84,9 @@ final class RadarModel: ObservableObject {
     private var pipes: [Pipe] = []
     private var sleepGuard: Process?
     private var pending = Data()
-    private let preferences = UserDefaults.standard
+    private let preferences = Bundle.main.bundleIdentifier == "local.launchradar.app"
+        ? UserDefaults.standard
+        : (UserDefaults(suiteName: "local.launchradar.app") ?? .standard)
 
     init() {
         tasks = PurchaseTaskStore.load(preferences: preferences, defaultsURL: Bundle.main.url(forResource: "default-tasks", withExtension: "json"))
@@ -208,9 +221,9 @@ final class RadarModel: ObservableObject {
     func add(name: String, url: String, demo: Bool = false, browser: PurchaseBrowser? = nil, douyinHandoff: Bool = false, tmall: Bool = false, jd: Bool = false) {
         let host = URL(string: url)?.host?.lowercased() ?? ""
         let apple = ["apple.com", "apple.com.cn"].contains { host == $0 || host.hasSuffix("." + $0) }
-        tasks.append(PurchaseTask(name: name, url: url, demo: demo, appleFlow: apple && !douyinHandoff && !tmall && !jd, douyinHandoff: douyinHandoff, tmall: tmall, tmallFlow: tmall, jd: jd, jdFlow: jd, browser: douyinHandoff || tmall ? .chrome : browser ?? (jd ? .safari : nil)))
+        tasks.append(PurchaseTask(name: name, url: url, demo: demo, appleFlow: apple && !douyinHandoff && !tmall && !jd, douyinHandoff: douyinHandoff, tmall: tmall, tmallFlow: tmall, jd: jd, jdFlow: jd, submitOrder: jd || tmall ? true : nil, browser: douyinHandoff || tmall ? .chrome : browser ?? (jd ? .safari : nil)))
         if douyinHandoff { tasks[tasks.count - 1].message = "在手机抖音中准备商品、规格和地址；电脑到点提醒" }
-        if jd { tasks[tasks.count - 1].message = "打开京东购物车，登录、整理本次要购买的商品并核对规格，再绑定全选" }
+        if jd { tasks[tasks.count - 1].message = "打开京东购物车，登录并核对商品规格；购物车无需绑定按钮" }
         if tmall { tasks[tasks.count - 1].message = "打开商品并核对旗舰店，登录、选好规格，再绑定购买按钮" }
         persist()
     }
@@ -229,7 +242,7 @@ final class RadarModel: ObservableObject {
         if let index = tasks.firstIndex(where: { $0.id == task.id }) {
             tasks[index].state = "opening"; tasks[index].message = "正在打开浏览器…"; tasks[index].delayMs = nil
         }
-        send(["type": "open", "id": task.id, "url": task.url, "name": task.name, "demo": task.demo, "appleFlow": task.appleFlow ?? false, "tmallFlow": task.tmallFlow ?? false, "jdFlow": task.jdFlow ?? false, "douyinHandoff": task.douyinHandoff ?? false, "submitOrder": task.submitOrder ?? false, "browser": task.selectedBrowser.rawValue])
+        send(["type": "open", "id": task.id, "url": task.url, "name": task.name, "demo": task.demo, "appleFlow": task.appleFlow ?? false, "tmallFlow": task.tmallFlow ?? false, "jdFlow": task.jd == true || task.jdFlow == true, "douyinHandoff": task.douyinHandoff ?? false, "submitOrder": task.jd == true || task.tmall == true || task.submitOrder == true, "browser": task.selectedBrowser.rawValue])
     }
 
     func changeBrowser(_ id: String, to browser: PurchaseBrowser) {
@@ -238,7 +251,7 @@ final class RadarModel: ObservableObject {
         send(["type": "remove", "id": id])
         tasks[index].browser = browser
         tasks[index].state = "idle"
-        tasks[index].message = "浏览器已切换，请重新打开并绑定按钮"
+        tasks[index].message = tasks[index].isTmallCart || tasks[index].isJDCart ? "浏览器已切换，请重新打开购物车" : "浏览器已切换，请重新打开并绑定按钮"
         tasks[index].delayMs = nil
         persist()
     }
@@ -251,12 +264,14 @@ final class RadarModel: ObservableObject {
     }
 
     var canArm: Bool {
-        connected && !running && !tasks.filter(\.enabled).isEmpty && tasks.filter(\.enabled).allSatisfy { $0.douyinHandoff == true || ["bound", "ready"].contains($0.state) }
+        connected && !running && !tasks.filter(\.enabled).isEmpty && tasks.filter(\.enabled).allSatisfy {
+            $0.douyinHandoff == true || ["bound", "ready"].contains($0.state) || (($0.isTmallCart || $0.isJDCart) && $0.state == "opened")
+        }
     }
 
     func schedule(at date: Date) {
         guard canArm else { return }
-        let date = Date(timeIntervalSince1970: floor(date.timeIntervalSince1970))
+        let date = Date(timeIntervalSince1970: floor(date.timeIntervalSince1970 / 60) * 60)
         guard date.timeIntervalSinceNow >= 1 else { error = "请设置至少一秒后的运行时间"; return }
         target = date
         hasScheduledTime = true
@@ -283,7 +298,7 @@ final class RadarModel: ObservableObject {
         phase = "正在检查各页面…"
         preventSleep()
         let selected = tasks.filter(\.enabled)
-        send(["type": type, "ids": selected.map(\.id), "douyinReminders": selected.filter { $0.douyinHandoff == true }.map { ["id": $0.id, "url": $0.url] }, "appleFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.appleFlow ?? false) }), "tmallFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.tmallFlow ?? false) }), "jdFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.jdFlow ?? false) }), "submitOrders": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.submitOrder ?? false) }), "target": target.timeIntervalSince1970 * 1000])
+        send(["type": type, "ids": selected.map(\.id), "douyinReminders": selected.filter { $0.douyinHandoff == true }.map { ["id": $0.id, "url": $0.url] }, "appleFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.appleFlow ?? false) }), "tmallFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.tmallFlow ?? false) }), "jdFlows": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.jd == true || $0.jdFlow == true) }), "submitOrders": Dictionary(uniqueKeysWithValues: selected.map { ($0.id, $0.jd == true || $0.tmall == true || $0.submitOrder == true) }), "target": target.timeIntervalSince1970 * 1000])
     }
 
     func resume(_ task: PurchaseTask) {
@@ -291,7 +306,7 @@ final class RadarModel: ObservableObject {
         running = true
         phase = "正在核查页面并继续结账"
         preventSleep()
-        send(["type": "resume", "id": task.id, "submitOrder": task.submitOrder ?? false])
+        send(["type": "resume", "id": task.id, "submitOrder": task.jd == true || task.tmall == true || task.submitOrder == true])
     }
 
     private func preventSleep() {

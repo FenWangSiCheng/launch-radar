@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { checkJDAction, continueJDCheckout, isJDURL, resolveJDButton } from '../engine/jd-flow.mjs';
+import { checkJDAction, continueJDCheckout, isJDURL, prepareJDCartAtRelease, resolveJDButton } from '../engine/jd-flow.mjs';
 process.env.PLAYWRIGHT_BROWSERS_PATH ??= 'engine/browsers';
 const { chromium } = await import('playwright');
 const browser = await chromium.launch({ headless: true });
@@ -15,6 +15,31 @@ async function fixture(url, html, test) {
   try { await test(page); checks++; } finally { await page.close(); }
 }
 try {
+  {
+    const page = await browser.newPage();
+    let loads = 0;
+    await page.route('**/*', route => {
+      loads++;
+      return route.fulfill({ contentType: 'text/html; charset=utf-8', body: loads < 3
+        ? '<p>商品暂不可选</p><div class="_submitBtn_test">去结算 (0)</div>'
+        : `<label><input id="all" type="checkbox">全选</label><input class="item" type="checkbox"><input class="item" type="checkbox"><p id="selected">未选中</p><div class="_submitBtn_test" id="settle">去结算 (2)</div><script>all.onchange=()=>{document.querySelectorAll('.item').forEach(item=>item.checked=all.checked);selected.textContent=all.checked?'已选中':'未选中'}</script>` });
+    });
+    await page.goto(cart);
+    const result = await prepareJDCartAtRelease(page, { cancelled: false }, () => {}, { timeoutMs: 5000, pollMs: 10 });
+    assert.equal(loads, 3);
+    assert.equal(await page.locator('#all').isChecked(), true);
+    assert.deepEqual(await page.locator('.item').evaluateAll(items => items.map(item => item.checked)), [true, true]);
+    assert.equal(await result.button.innerText(), '去结算 (2)');
+    assert.equal(result.kind, 'cart');
+    checks++;
+    await page.close();
+  }
+  await fixture(cart, '<p>京东购物车数据加载中</p>', async page => {
+    await assert.rejects(prepareJDCartAtRelease(page, { cancelled: false }, () => {}, { timeoutMs: 200, pollMs: 10 }), /1 分钟/);
+  });
+  await fixture(cart, '<p>购物车跑丢了</p>', async page => {
+    await assert.rejects(prepareJDCartAtRelease(page, { cancelled: false }, () => {}, { timeoutMs: 1000, pollMs: 10 }), /购物车数据加载失败/);
+  });
   assert.ok(isJDURL(cart));
   for (const url of ['http://cart.jd.com/cart_index', 'https://jd.com.attacker.test', 'https://fakejd.com', 'https://jd.com@attacker.test', 'invalid']) assert.ok(!isJDURL(url));
   checks++;
@@ -35,81 +60,62 @@ try {
       assert.equal(await checkJDAction(page, page.locator('#next')), 'cart');
     });
   }
-  // The existing submission checkbox also opts into JD integrated payment.
-  // Preserve the selected method and prevent another click on resume.
-  for (const submitOrder of [false, true]) {
-    await fixture(confirm + '?cartSplitPage=1', '<p>升级公告：结算页支付功能升级，提供多种支付工具，如需使用原收银台完成支付，可选择【更多支付】进入。</p><span>商品结算</span><em>付款详情</em><em>商品总额</em><div>￥12999.00</div><input id="method" type="checkbox" checked><div class="payment-action-submit"><button onclick="window.paid=(window.paid||0)+1;document.body.insertAdjacentHTML(\'beforeend\',\'<h1>京东收银台</h1>\')">立即支付</button></div>', async page => {
-      const progress = {};
-      if (submitOrder) assert.equal(await checkJDAction(page, page.locator('button'), { submitOrder }), 'pay');
-      else await assert.rejects(checkJDAction(page, page.locator('button')), /开启自动提交/);
-      const result = await follow(page, { submitOrder, progress });
-      assert.equal(result.state, submitOrder ? 'paymentReady' : 'reviewOrder');
-      assert.equal(await page.evaluate(() => window.paid || 0), submitOrder ? 1 : 0);
-      if (submitOrder) {
-        assert.equal((await follow(page, { submitOrder, progress })).state, 'paymentReady');
-        assert.equal(await page.evaluate(() => window.paid), 1);
-      }
-      assert.equal(await page.locator('#method').isChecked(), true);
-    });
-  }
-  await fixture(confirm, `${order}<button onclick="window.submissions=(window.submissions||0)+1">提交订单</button>`, async page => {
-    assert.equal((await follow(page)).state, 'reviewOrder');
-    await assert.rejects(checkJDAction(page, page.locator('button')), /开启自动提交/);
-    assert.equal(await page.evaluate(() => window.submissions), undefined);
+  // JD always continues from checkout to the integrated immediate-pay control.
+  await fixture(confirm + '?cartSplitPage=1', '<p>升级公告：结算页支付功能升级，提供多种支付工具，如需使用原收银台完成支付，可选择【更多支付】进入。</p><span>商品结算</span><em>付款详情</em><em>商品总额</em><div>￥12999.00</div><input id="method" type="checkbox" checked><div class="payment-action-submit"><button onclick="window.paid=(window.paid||0)+1;document.body.insertAdjacentHTML(\'beforeend\',\'<h1>京东收银台</h1>\')">立即支付</button></div>', async page => {
+    const progress = {};
+    assert.equal(await checkJDAction(page, page.locator('button')), 'pay');
+    assert.equal((await follow(page, { progress })).state, 'paymentReady');
+    assert.equal((await follow(page, { progress })).state, 'paymentReady');
+    assert.equal(await page.evaluate(() => window.paid), 1);
+    assert.equal(await page.locator('#method').isChecked(), true);
   });
-  await fixture(confirm, `${order}<button id="submit"><span>提交订单</span></button><script>
-    window.submissions=0;window.payments=0;submit.onclick=()=>{window.submissions++;document.body.innerHTML='<h1>京东收银台</h1><button onclick="window.payments++">立即支付</button>';};
+  // The integrated payment control can mount after the rest of checkout.
+  await fixture(confirm, `${order}<p>升级公告：结算页支付功能升级</p><span>付款详情</span><div id="payment"></div><script>
+    window.payClicks=0;
+    setTimeout(()=>{payment.innerHTML='<div class="payment-action-submit"><button id="pay">立即支付</button></div>';pay.onclick=()=>{window.payClicks++;document.body.insertAdjacentHTML('beforeend','<h1>京东收银台</h1>')};},30);
     </script>`, async page => {
-    const progress = {};
-    assert.equal((await follow(page, { submitOrder: true, progress })).state, 'paymentReady');
-    assert.equal((await follow(page, { submitOrder: true, progress })).state, 'paymentReady');
-    assert.equal(await page.evaluate(() => window.submissions), 1);
-    assert.equal(await page.evaluate(() => window.payments), 0);
-  });
-  await fixture(confirm, `${order}<button onclick="window.submissions=(window.submissions||0)+1">提交订单</button>`, async page => {
-    const progress = {};
-    assert.equal((await follow(page, { submitOrder: true, progress })).state, 'uncertain');
-    assert.equal((await follow(page, { submitOrder: true, progress })).state, 'uncertain');
-    assert.equal(await page.evaluate(() => window.submissions), 1);
-  });
-  await fixture(confirm, `${order}<button id="submit">提交订单</button><script>submit.onclick=()=>document.body.innerHTML='<h1>订单提交成功</h1>';</script>`, async page => {
-    assert.equal((await follow(page, { submitOrder: true })).state, 'orderSubmitted');
-  });
-  await fixture(confirm, `${order}<button id="submit">提交订单</button><script>
-    window.clicks=0;submit.onclick=()=>{window.clicks++;if(window.clicks<3)document.body.insertAdjacentHTML('beforeend','<div class="ui-dialog">繁忙<button class="ui-dialog-close" onclick="this.parentElement.remove()">关闭</button></div>');else document.body.innerHTML='<h1>京东收银台</h1>';};
-    </script>`, async page => {
-    const progress = {};
-    assert.equal((await follow(page, { submitOrder: true, progress, timeoutMs: 1500 })).state, 'paymentReady');
-    assert.equal(progress.submissionRetries, 2);
-    assert.equal(await page.evaluate(() => window.clicks), 3);
-  });
-  await fixture(confirm, `${order}<button id="submit">提交订单</button><script>
-    window.clicks=0;submit.onclick=()=>{window.clicks++;document.body.insertAdjacentHTML('beforeend','<div role="dialog">繁忙<button onclick="this.parentElement.remove()">确定</button></div>');};
-    </script>`, async page => {
-    const progress = {};
-    assert.match((await follow(page, { submitOrder: true, progress, timeoutMs: 3000 })).message, /50 次/);
-    assert.equal(await page.evaluate(() => window.clicks), 51);
-    assert.match((await follow(page, { submitOrder: true, progress })).message, /50 次/);
-    assert.equal(await page.evaluate(() => window.clicks), 51);
+    assert.equal((await follow(page, { timeoutMs: 1000 })).state, 'paymentReady');
+    assert.equal(await page.evaluate(() => window.payClicks), 1);
   });
   await fixture(cart, '<label><input type="checkbox" checked>全选</label><p>合计:￥12999.00</p><div class="_submitBtn_test">去结算 (1)</div><div role="dialog">系统繁忙，结算失败，请重试<button onclick="this.parentElement.remove()">确定</button></div><script>window.clicks=0;document.querySelector("._submitBtn_test").onclick=()=>{window.clicks++;location.href="https://trade.jd.com/shopping/order/getOrderInfo.action";};</script>', async page => {
-    await page.route(confirm, route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: `${order}<button>提交订单</button>` }));
+    await page.route(confirm, route => route.fulfill({ contentType: 'text/html; charset=utf-8', body: `${order}<div class="payment-action-submit"><button onclick="document.body.insertAdjacentHTML('beforeend','<h1>京东收银台</h1>')">立即支付</button></div>` }));
     const progress = { pending: 'cart' };
-    assert.equal((await follow(page, { progress, retryDelays: [0], timeoutMs: 1500 })).state, 'reviewOrder');
-    assert.equal(progress.retries.cart, 1);
+    assert.equal((await follow(page, { progress, timeoutMs: 1500 })).state, 'paymentReady');
+    assert.ok(progress.retryDeadlines.cart > Date.now());
+    assert.equal(progress.retries.cart, undefined);
   });
-  await fixture(confirm, `${order}<div role="dialog">正在排队，请勿刷新</div><button onclick="window.clicked=true">提交订单</button>`, async page => {
+  await fixture(cart, '<label><input type="checkbox" checked>全选</label><div class="_submitBtn_test" id="next">去结算 (1)</div><div role="dialog">系统繁忙，结算失败，请重试<button onclick="this.parentElement.remove()">确定</button></div><script>window.clicks=0;next.onclick=()=>{window.clicks++;document.body.insertAdjacentHTML("beforeend",\'<div role="dialog">结算失败，请重试<button onclick="this.parentElement.remove()">确定</button></div>\');};</script>', async page => {
+    const progress = { pending: 'cart' };
+    const options = { progress, timeoutMs: 2000, checkoutRetryWindowMs: 250 };
+    const result = await follow(page, options);
+    assert.equal(result.state, 'handoff');
+    assert.match(result.message, /去结算错误已重试 1 分钟/);
+    const clicks = await page.evaluate(() => window.clicks);
+    assert.ok(clicks > 1);
+    assert.equal(progress.retries.cart, undefined);
+    const deadline = progress.retryDeadlines.cart;
+    assert.match((await follow(page, options)).message, /去结算错误已重试 1 分钟/);
+    assert.equal(progress.retryDeadlines.cart, deadline);
+    assert.equal(await page.evaluate(() => window.clicks), clicks);
+  });
+  // An expired checkout retry window must not consume the payment-stage window.
+  await fixture(confirm, '<div class="payment-action-submit"><button onclick="window.clicks=(window.clicks||0)+1;document.body.insertAdjacentHTML(\'beforeend\',\'<h1>京东收银台</h1>\')">立即支付</button></div>', async page => {
+    const progress = { pending: 'cart', retryDeadlines: { cart: Date.now() - 1 } };
+    assert.equal((await follow(page, { progress })).state, 'paymentReady');
+    assert.equal(await page.evaluate(() => window.clicks), 1);
+  });
+  await fixture(confirm, `${order}<div role="dialog">正在排队，请勿刷新</div><div class="payment-action-submit"><button onclick="window.clicked=true">立即支付</button></div>`, async page => {
     assert.match((await follow(page, { submitOrder: true, queueTimeoutMs: 30 })).message, /排队等待/);
     assert.equal(await page.evaluate(() => window.clicked), undefined);
   });
-  for (const html of ['<input required>', '<input type="password">', '<p>请完成验证</p>', '<div role="alert">商品无货</div>', '<button>提交订单</button>']) {
-    await fixture(confirm, `${order}${html}<button id="submit" onclick="window.clicked=true">提交订单</button>`, async page => {
+  for (const html of ['<input required>', '<input type="password">', '<p>请完成验证</p>', '<div role="alert">商品无货</div>']) {
+    await fixture(confirm, `${order}${html}<div class="payment-action-submit"><button onclick="window.clicked=true">立即支付</button></div>`, async page => {
       assert.equal((await follow(page, { submitOrder: true })).state, 'handoff');
       assert.equal(await page.evaluate(() => window.clicked), undefined);
     });
   }
   for (const url of ['https://example.com/order', 'https://trade.jd.com/other', 'https://jd.com.attacker.test/shopping/order/getOrderInfo.action']) {
-    await fixture(url, `${order}<button onclick="window.clicked=true">提交订单</button>`, async page => {
+    await fixture(url, `${order}<div class="payment-action-submit"><button onclick="window.clicked=true">立即支付</button></div>`, async page => {
       assert.equal((await follow(page, { submitOrder: true })).state, 'handoff');
       await assert.rejects(checkJDAction(page, page.locator('button'), { submitOrder: true }), /只支持/);
       assert.equal(await page.evaluate(() => window.clicked), undefined);
@@ -126,20 +132,15 @@ try {
     assert.equal((await follow(page, { submitOrder: true })).state, 'paymentReady');
     assert.equal(await page.evaluate(() => window.paid), undefined);
   });
-  await fixture(confirm, `${order}<button onclick="window.clicked=true">提交订单</button>`, async page => {
+  await fixture(confirm, `${order}<div class="payment-action-submit"><button onclick="window.clicked=true">立即支付</button></div>`, async page => {
     assert.match((await follow(page, { submitOrder: true }, { cancelled: true })).message, /已停止/);
     assert.equal(await page.evaluate(() => window.clicked), undefined);
   });
-  await fixture(confirm, `${order}<button id="submit" disabled onclick="window.clicked=true">提交订单</button>`, async page => {
+  await fixture(confirm, `${order}<div class="payment-action-submit"><button id="submit" disabled onclick="window.clicked=true">立即支付</button></div>`, async page => {
     const run = { cancelled: false };
     setTimeout(() => { run.cancelled = true; }, 30);
     assert.match((await follow(page, { submitOrder: true }, run)).message, /已停止/);
     assert.equal(await page.evaluate(() => window.clicked), undefined);
-  });
-  await fixture(confirm, `${order}<button id="submit">提交订单</button><script>window.clicks=0;submit.onclick=()=>{window.clicks++;document.body.innerHTML='<h1>收银台</h1>';};</script>`, async page => {
-    await page.evaluate(() => { const body = document.body; body.remove(); setTimeout(() => document.documentElement.appendChild(body), 60); });
-    assert.equal((await follow(page, { submitOrder: true })).state, 'paymentReady');
-    assert.equal(await page.evaluate(() => window.clicks), 1);
   });
   // An unchanged confirmation page is ambiguous; resuming must not repeat it.
   await fixture(confirm, `${order}<div class="payment-action-submit"><button onclick="window.clicks=(window.clicks||0)+1">立即支付</button></div>`, async page => {
@@ -155,15 +156,17 @@ try {
       window.clicks=0;submit.onclick=()=>{window.clicks++;if(${persistent}||window.clicks<3)document.body.insertAdjacentHTML('beforeend','<div role="dialog">繁忙<button onclick="this.parentElement.remove()">确定</button></div>');else document.body.innerHTML='<h1>等待买家付款</h1><button onclick="window.paid=true">立即支付</button>';};
       </script>`, async page => {
       const progress = {};
-      const result = await follow(page, { submitOrder: true, progress, timeoutMs: 3000 });
+      const result = await follow(page, { progress, timeoutMs: 3000, submissionRetryWindowMs: persistent ? 250 : 3000 });
       if (persistent) {
-        assert.match(result.message, /50 次订单重试上限/);
-        assert.match((await follow(page, { submitOrder: true, progress })).message, /50 次订单重试上限/);
-        assert.equal(await page.evaluate(() => window.clicks), 51);
-        assert.equal(progress.submissionRetries, 50);
+        assert.match(result.message, /重试 1 分钟/);
+        const clicks = await page.evaluate(() => window.clicks);
+        assert.ok(clicks > 1);
+        assert.equal(progress.submissionRetries, undefined);
+        assert.match((await follow(page, { progress, submissionRetryWindowMs: 250 })).message, /重试 1 分钟/);
+        assert.equal(await page.evaluate(() => window.clicks), clicks);
       } else {
         assert.equal(result.state, 'paymentReady');
-        assert.equal(progress.submissionRetries, 2);
+        assert.equal(progress.submissionRetries, undefined);
         assert.equal(await page.evaluate(() => window.clicks), 3);
         assert.equal(await page.evaluate(() => window.paid), undefined);
         assert.equal((await follow(page, { submitOrder: true, progress })).state, 'paymentReady');
@@ -176,6 +179,22 @@ try {
     await follow(page, { submitOrder: true, progress });
     assert.equal(await page.evaluate(() => window.paid), undefined);
   });
+  for (const expired of [false, true]) {
+    await fixture(confirm, `${order}<div class="payment-action-submit"><button id="submit">立即支付</button></div><script>
+      window.clicks=0;submit.onclick=()=>{window.clicks++;document.body.insertAdjacentHTML('beforeend',
+        '<div class="scantoPayMain" role="dialog"><h2>微信支付</h2><p>微信APP扫码支付</p><p role="alert">${expired ? '二维码已过期，请重新获取二维码' : '当前支付环境安全，请放心支付'}</p><img alt="付款码" src="data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs="><button id="close" onclick="this.parentElement.remove()">关闭</button></div>');};
+      </script>`, async page => {
+      const progress = {};
+      const result = await follow(page, { submitOrder: true, progress });
+      assert.equal(result.state, 'paymentReady');
+      assert.match(result.message, expired ? /二维码已过期/ : /扫码付款/);
+      assert.equal(await page.evaluate(() => window.clicks), 1);
+      assert.equal(await page.locator('.scantoPayMain').count(), 1);
+      assert.equal(progress.submissionRetries || 0, 0);
+      assert.equal((await follow(page, { submitOrder: true, progress })).state, 'paymentReady');
+      assert.equal(await page.evaluate(() => window.clicks), 1);
+    });
+  }
   for (const before of ['<input required>', '<p>请完成验证</p>']) {
     await fixture(confirm, `${before}<div class="payment-action-submit"><button onclick="window.paid=true">立即支付</button></div>`, async page => {
       await assert.rejects(checkJDAction(page, page.locator('button'), { submitOrder: true }));

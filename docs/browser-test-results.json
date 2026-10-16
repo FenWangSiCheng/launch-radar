@@ -1,21 +1,21 @@
 {
-  "testedAt": "2026-10-14T09:33:56.965Z",
+  "testedAt": "2026-10-16T04:19:33.720Z",
   "environment": "local headless Chromium; simulated checkout only",
   "timing": [
     {
       "platform": "2",
-      "dispatchDelayMs": 6,
-      "actualClickDelayMs": 40
+      "dispatchDelayMs": 5,
+      "actualClickDelayMs": 42
     },
     {
       "platform": "1",
-      "dispatchDelayMs": 6,
-      "actualClickDelayMs": 40
+      "dispatchDelayMs": 4,
+      "actualClickDelayMs": 45
     },
     {
       "platform": "0",
-      "dispatchDelayMs": 5,
-      "actualClickDelayMs": 40
+      "dispatchDelayMs": 4,
+      "actualClickDelayMs": 46
     }
   ],
   "checks": [
@@ -31,13 +31,12 @@
     "Apple missing address pauses and resumes after filling",
     "manual run dispatches immediately",
     "manual trigger replaces timer without duplicate execution",
-    "Tmall checkout submits once and stops before payment",
+    "Tmall cart checks without a bound button and clicks immediate pay once",
     "Tmall checkout supports a new order tab without duplicate submission",
     "Tmall unknown post-submit notice pauses and resumes without resubmission",
     "JD div binding does not checkout",
-    "JD scheduled checkout supports same-tab and popup navigation",
-    "JD submission guard survives resume",
-    "JD default stops at confirmation",
-    "JD submission checkbox clicks integrated payment once and preserves resume guard"
+    "JD checkout clicks immediate pay in same-tab and popup navigation",
+    "JD clicks immediate pay even with an old disabled submit setting",
+    "JD never repeats immediate pay on resume"
   ]
 }

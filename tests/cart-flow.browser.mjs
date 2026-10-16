@@ -6,9 +6,10 @@ const { chromium } = await import('playwright');
 const browser = await chromium.launch({ headless: true });
 let checks = 0;
 try {
-  for (const [url, prepare, follow, resolve, check] of [
-    ['https://cart.jd.com/cart_index', prepareJDAction, continueJDCheckout, resolveJDButton, checkJDAction],
-    ['https://cart.taobao.com/cart.htm', prepareTmallAction, continueTmallCheckout, resolveTmallButton, checkTmallAction]
+  // Checkout errors retry inside a one-minute window on both platforms.
+  for (const [url, prepare, follow, resolve, check, retryOptions, retryMessage] of [
+    ['https://cart.jd.com/cart_index', prepareJDAction, continueJDCheckout, resolveJDButton, checkJDAction, { checkoutRetryWindowMs: 250 }, /去结算错误已重试 1 分钟/],
+    ['https://cart.taobao.com/cart.htm', prepareTmallAction, continueTmallCheckout, resolveTmallButton, checkTmallAction, { checkoutRetryWindowMs: 250 }, /去结算错误已重试 1 分钟/]
   ]) {
     for (const checked of [false, true]) {
       const page = await browser.newPage();
@@ -30,12 +31,14 @@ try {
       assert.equal(await page.evaluate(() => window.selections), checked ? 0 : 1);
       await button.click();
       const progress = { pending: 'cart' };
-      const result = await follow(page, run, () => {}, { progress, retryDelays: [0, 0], timeoutMs: 1500, pollMs: 10 });
-      assert.match(result.message, /2 次重试上限/);
-      assert.equal(await page.evaluate(() => window.clicks), 3);
+      const options = { progress, timeoutMs: 1500, pollMs: 10, ...retryOptions };
+      const result = await follow(page, run, () => {}, options);
+      assert.match(result.message, retryMessage);
+      const retries = await page.evaluate(() => window.clicks);
+      assert.ok(retries > 1);
       assert.equal(await page.evaluate(() => window.selections), checked ? 0 : 1);
-      await follow(page, run, () => {}, { progress, retryDelays: [0, 0], timeoutMs: 200, pollMs: 10 });
-      assert.equal(await page.evaluate(() => window.clicks), 3);
+      await follow(page, run, () => {}, { ...options, timeoutMs: 200 });
+      assert.equal(await page.evaluate(() => window.clicks), retries);
       checks++;
       await page.close();
     }

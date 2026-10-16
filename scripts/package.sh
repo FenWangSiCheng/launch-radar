@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 cd "$(dirname "$0")/.."
+swift scripts/snapshot-tasks.swift
 bash scripts/build.sh
 stage="$(mktemp -d "$PWD/dist/.installer-XXXXXX")"
 trap 'rm -rf "$stage"' EXIT

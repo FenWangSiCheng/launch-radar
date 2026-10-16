@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { chromium } from 'playwright';
 import { SafariPage, browserChoice, pickScript } from '../engine/safari.mjs';
 import { continueAppleCheckout, initialAppleProgress } from '../engine/apple-flow.mjs';
-import { resolveJDButton, prepareJDAction, continueJDCheckout } from '../engine/jd-flow.mjs';
+import { resolveJDButton, prepareJDAction, prepareJDCartAtRelease, continueJDCheckout } from '../engine/jd-flow.mjs';
 
 assert.equal(browserChoice({ browser: 'safari' }), 'safari');
 assert.equal(browserChoice({ browser: 'chrome' }), 'chrome');
@@ -19,6 +19,7 @@ try {
   const page = new SafariPage('test', async (action, id, source) => {
     if (action === 'url') return native.url();
     if (action === 'evaluate') return native.evaluate(source);
+    if (action === 'reload') { await native.reload({ waitUntil: 'domcontentloaded' }); return ''; }
     throw new Error(`Unexpected action: ${action}`);
   });
   await page.refreshURL();
@@ -108,8 +109,22 @@ try {
   assert.equal(jdResult.state, 'paymentReady');
   assert.equal(page.url(), confirm, 'Safari must refresh URL after checkout navigation');
   assert.equal(await native.evaluate(() => submissions), 2);
-  assert.equal(jdProgress.submissionRetries, 1);
+  assert.ok(jdProgress.submissionRetryDeadlineAt > Date.now(), 'the pay-dialog budget is a time window');
   assert.equal((await continueJDCheckout(page, { cancelled: false }, () => {}, { submitOrder: true, progress: jdProgress, timeoutMs: 100 })).state, 'paymentReady');
   assert.equal(await native.evaluate(() => submissions), 2, 'resume must not submit again');
+  await native.unroute('https://cart.jd.com/**');
+  let cartLoads = 0;
+  await native.route('https://cart.jd.com/**', route => {
+    cartLoads++;
+    return route.fulfill({ contentType: 'text/html; charset=utf-8', body: cartLoads < 2
+      ? '<p>商品暂不可选</p><div class="_submitBtn_test">去结算 (0)</div>'
+      : '<label><input id="all" type="checkbox">全选</label><div class="_submitBtn_test">去结算 (2)</div>' });
+  });
+  await native.goto(cart);
+  await page.refreshURL();
+  const refreshed = await prepareJDCartAtRelease(page, { cancelled: false }, () => {}, { timeoutMs: 5000, pollMs: 10 });
+  assert.equal(cartLoads, 2);
+  assert.equal(await native.locator('#all').isChecked(), true);
+  assert.equal(refreshed.kind, 'cart');
   console.log('PASS: Safari adapter binding, trial click, disabled button, overlay, stale target, cancel, Apple checkout protection, JD binding/select-all/navigation/submission/retry/resume (Chromium transport)');
 } finally { await browser.close(); }
